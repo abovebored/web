@@ -1,16 +1,19 @@
-var _ = require('underscore')
 var assert = require('assert')
 var fs = require('fs')
-var http = require('http')
 var nock = require('nock')
 var path = require('path')
-var uuid = require('node-uuid')
+var uuid = require('uuid')
 
 var api = require(__dirname + '/../dadi/lib/api')
-var Server = require(__dirname + '/../dadi/lib')
 var Controller = require(__dirname + '/../dadi/lib/controller')
-var Datasource = require(__dirname + '/../dadi/lib/datasource')
 var Page = require(__dirname + '/../dadi/lib/page')
+var Server = require(__dirname + '/../dadi/lib')
+
+var serverOptions = {
+  engines: [require('web-es6-templates')]
+}
+
+var Server = require(__dirname + '/../dadi/lib')(serverOptions)
 
 var config
 var testConfigString
@@ -24,15 +27,17 @@ function cookie (res) {
   return (setCookie && setCookie[0]) || undefined
 }
 
-var TestHelper = function() {
+var TestHelper = function () {
   config = require(configKey)
-  this.originalConfigString = fs.readFileSync(config.configPath()+'.sample').toString()
-  //console.log(this)
+  this.originalConfigString = fs
+    .readFileSync(config.configPath() + '.sample')
+    .toString()
+  // console.log(this)
   config.loadFile(path.resolve(config.configPath()))
 }
 
-TestHelper.prototype.setupApiIntercepts = function() {
-  var host = 'http://' + config.get('api.host') + ':' + config.get('api.port')
+TestHelper.prototype.setupApiIntercepts = function () {
+  var host = 'http://' + config.get('api').host + ':' + config.get('api').port
 
   var apiTestScope = nock(host)
     .get('/')
@@ -41,9 +46,7 @@ TestHelper.prototype.setupApiIntercepts = function() {
   var authScope1 = nock(host)
     .post('/token')
     .times(10)
-    .reply(200, { accessToken: uuid.v4()})
-
-  return
+    .reply(200, { accessToken: uuid.v4() })
 }
 
 TestHelper.prototype.disableApiConfig = function () {
@@ -79,19 +82,19 @@ TestHelper.prototype.enableApiConfig = function () {
 TestHelper.prototype.getConfig = function () {
   return new Promise((resolve, reject) => {
     var originalConfig = JSON.parse(this.originalConfigString)
-    return resolve(_.extend({}, originalConfig))
+    return resolve(Object.assign({}, originalConfig))
   })
 }
 
 TestHelper.prototype.updateConfig = function (configBlock) {
   return new Promise((resolve, reject) => {
     var originalConfig = JSON.parse(this.originalConfigString)
-    var newConfig = _.extend(originalConfig, configBlock)
+    var newConfig = Object.assign(originalConfig, configBlock)
 
     fs.writeFileSync(config.configPath(), JSON.stringify(newConfig, null, 2))
     config.loadFile(path.resolve(config.configPath()))
     delete require.cache[configKey]
-    return resolve('')
+    return resolve(config)
   })
 }
 
@@ -100,8 +103,18 @@ TestHelper.prototype.resetConfig = function () {
     fs.writeFileSync(config.configPath(), this.originalConfigString)
     config.loadFile(path.resolve(config.configPath()))
     delete require.cache[configKey]
-    return resolve('')
+    return resolve(config)
   })
+}
+
+TestHelper.prototype.extractCookieValue = function (res, cookieName) {
+  var cookies = res.headers['set-cookie']
+  var cookie = cookies.find(cookie => {
+    return cookie.startsWith(cookieName + '=')
+  })
+  var data = cookie.split(';')[0]
+  var value = data.split('=')[1]
+  return value
 }
 
 /**
@@ -109,6 +122,9 @@ TestHelper.prototype.resetConfig = function () {
  */
 TestHelper.prototype.shouldSetCookie = function (name) {
   return function (res) {
+    // console.log("***")
+    // console.log("headers:", res.headers)
+    // console.log("***")
     var header = cookie(res)
     assert.ok(header, 'should have a cookie header')
     assert.equal(header.split('=')[0], name, 'should set cookie ' + name)
@@ -116,18 +132,21 @@ TestHelper.prototype.shouldSetCookie = function (name) {
 }
 
 /**
- * Test that the response doesn't have the specified header
+ * Test that the response does not have the specified header
  */
 TestHelper.prototype.shouldNotHaveHeader = function (header) {
   return function (res) {
-    assert.ok(!(header.toLowerCase() in res.headers), 'should not have ' + header + ' header')
+    assert.ok(
+      !(header.toLowerCase() in res.headers),
+      'should not have ' + header + ' header'
+    )
   }
 }
 
 TestHelper.prototype.setUpPages = function () {
   // create page 1
   var page1 = Page('page1', this.getPageSchema())
-  page1.template = 'test.dust'
+  page1.template = 'test.js'
   page1.routes[0].path = '/test'
   page1.datasources = []
   page1.events = []
@@ -142,7 +161,7 @@ TestHelper.prototype.setUpPages = function () {
 TestHelper.prototype.setUp404Page = function () {
   var page = Page('404', this.getPageSchema())
   page.name = '404'
-  page.template = '404.dust'
+  page.template = '404.js'
   page.routes[0].path = '/404'
   page.datasources = []
   page.events = []
@@ -154,7 +173,13 @@ TestHelper.prototype.setUp404Page = function () {
   return pages
 }
 
-TestHelper.prototype.newPage = function (name, path, template, datasources, events) {
+TestHelper.prototype.newPage = function (
+  name,
+  path,
+  template,
+  datasources,
+  events
+) {
   var page = Page(name, this.getPageSchema())
   page.datasources = datasources
   page.template = template
@@ -169,7 +194,7 @@ TestHelper.prototype.newPage = function (name, path, template, datasources, even
 
 TestHelper.prototype.startServer = function (pages) {
   return new Promise((resolve, reject) => {
-    if (pages !== null && !_.isArray(pages)) {
+    if (pages !== null && !Array.isArray(pages)) {
       pages = [pages]
     }
 
@@ -184,21 +209,25 @@ TestHelper.prototype.startServer = function (pages) {
 
     Server.start(() => {
       var idx = 0
-      setTimeout(() => {
-        pages.forEach((page) => {
-          var controller = Controller(page, options)
+      // setTimeout(() => {
+      pages.forEach(page => {
+        var controller = Controller(page, options)
 
-          Server.addComponent({
+        Server.addComponent(
+          {
+            host: '',
             key: page.key,
             routes: page.routes,
             component: controller
-          }, false)
+          },
+          false
+        )
 
-          if (++idx === pages.length) {
-            return resolve('')
-          }
-        })
-      }, 200)
+        if (++idx === pages.length) {
+          return resolve(Server.compile(options).then(() => Server))
+        }
+      })
+      // }, 100)
     })
   })
 }
@@ -206,35 +235,31 @@ TestHelper.prototype.startServer = function (pages) {
 TestHelper.prototype.stopServer = function (done) {
   if (!Server.readyState) return done()
   Server.stop(function () {
-    setTimeout(function () {
-      done()
-    }, 200)
+    // setTimeout(function() {
+    done()
+    // }, 100)
   })
 }
 
 TestHelper.prototype.getPageSchema = function () {
   return {
-    'page': {
-      'name': 'Car Reviews',
-      'description': 'A collection of car reviews.',
-      'language': 'en'
+    page: {
+      name: 'Car Reviews',
+      description: 'A collection of car reviews.',
+      language: 'en'
     },
-    'settings': {
-      'cache': true
+    settings: {
+      cache: true
     },
-    'routes': [
+    routes: [
       {
-        'path': '/car-reviews/:make/:model'
+        path: '/car-reviews/:make/:model'
       }
     ],
-    'contentType': 'text/html',
-    'template': 'car-reviews.dust',
-    'datasources': [
-      'car-makes'
-    ],
-    'events': [
-      'car-reviews'
-    ]
+    contentType: 'text/html',
+    template: 'car-reviews.js',
+    datasources: ['car_makes'],
+    events: ['car-reviews']
   }
 }
 
@@ -247,15 +272,20 @@ TestHelper.prototype.getPathOptions = function () {
     pagePath: __dirname + '/../test/app/pages',
     partialPath: __dirname + '/../test/app/partials',
     eventPath: __dirname + '/../test/app/events',
-    routesPath: __dirname + '/../test/app/routes'
+    routesPath: __dirname + '/../test/app/routes',
+    publicPath: __dirname + '/../test/app/public'
   }
 }
 
-TestHelper.prototype.getSchemaFromFile = function (path, name, propertyToDelete) {
+TestHelper.prototype.getSchemaFromFile = function (
+  path,
+  name,
+  propertyToDelete
+) {
   var filepath = path + '/' + name + '.json'
   var schema
   if (fs.existsSync(filepath)) {
-    schema = JSON.parse(fs.readFileSync(filepath, {encoding: 'utf-8'}))
+    schema = JSON.parse(fs.readFileSync(filepath, { encoding: 'utf-8' }))
     if (typeof propertyToDelete !== 'undefined') {
       delete schema.datasource[propertyToDelete]
     }
@@ -268,9 +298,11 @@ TestHelper.prototype.clearCache = function () {
     if (fs.existsSync(filepath) && fs.lstatSync(filepath).isDirectory()) {
       fs.readdirSync(filepath).forEach(function (file, index) {
         var curPath = filepath + '/' + file
-        if (fs.lstatSync(curPath).isDirectory()) { // recurse
+        if (fs.lstatSync(curPath).isDirectory()) {
+          // recurse
           deleteFolderRecursive(curPath)
-        } else { // delete file
+        } else {
+          // delete file
           fs.unlinkSync(path.resolve(curPath))
         }
       })
@@ -292,7 +324,7 @@ TestHelper.prototype.clearCache = function () {
 }
 
 var instance
-module.exports = function() {
+module.exports = function () {
   if (!instance) {
     instance = new TestHelper()
   }
@@ -301,3 +333,9 @@ module.exports = function() {
 }
 
 module.exports.TestHelper = TestHelper
+module.exports.Server = Server
+module.exports.getNewServer = options => {
+  options = options || serverOptions
+
+  return require(__dirname + '/../dadi/lib')(options)
+}

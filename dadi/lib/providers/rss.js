@@ -1,6 +1,5 @@
 'use strict'
 
-const _ = require('underscore')
 const path = require('path')
 const request = require('request')
 const FeedParser = require('feedparser')
@@ -18,6 +17,7 @@ const RSSProvider = function () {}
 RSSProvider.prototype.initialise = function initialise (datasource, schema) {
   this.datasource = datasource
   this.schema = schema
+  this.processSchemaParams = false
   // this.setAuthStrategy()
 }
 
@@ -43,9 +43,9 @@ RSSProvider.prototype.buildQueryParams = function buildQueryParams () {
   params.count = datasource.count
   params.fields = ''
 
-  if (_.isArray(datasource.fields)) {
+  if (Array.isArray(datasource.fields)) {
     params.fields = datasource.fields.join(',')
-  } else if (_.isObject(datasource.fields)) {
+  } else if (datasource.fields && Object.keys(datasource.fields).length) {
     params.fields = Object.keys(datasource.fields).join(',')
   }
 
@@ -68,35 +68,71 @@ RSSProvider.prototype.load = function load (requestUrl, done) {
     const context = this
     // const queryParams = this.buildQueryParams()
 
-    this.cacheKey = [this.endpoint, encodeURIComponent(JSON.stringify(this.schema.datasource))].join('+')
-    this.dataCache = new DatasourceCache(this.datasource)
+    this.cacheKey = [
+      this.endpoint,
+      encodeURIComponent(JSON.stringify(this.schema.datasource))
+    ].join('+')
+    this.dataCache = new DatasourceCache()
 
-    this.dataCache.getFromCache((cachedData) => {
-      if (cachedData) return done(null, cachedData)
+    const cacheOptions = {
+      name: this.datasource.name,
+      caching: this.schema.datasource.caching,
+      cacheKey: this.cacheKey
+    }
+
+    this.dataCache.getFromCache(cacheOptions, cachedData => {
+      if (cachedData) {
+        try {
+          cachedData = JSON.parse(cachedData.toString())
+          return done(null, cachedData)
+        } catch (err) {
+          console.error(
+            'RSS: cache data incomplete, making HTTP request: ' +
+              err +
+              '(' +
+              cacheOptions.cacheKey +
+              ')'
+          )
+        }
+      }
 
       const items = []
       const feedparser = new FeedParser()
+
       const req = request(this.endpoint, {
         pool: false,
         headers: {
           'user-agent': 'DADI/Web',
-          'accept': 'text/html,application/xhtml+xml'
+          accept: 'text/html,application/xhtml+xml'
         }
       })
 
       // request events
       req.on('error', done)
-      req.on('response', (res) => {
+
+      req.on('response', res => {
         if (res.statusCode !== 200) return done('Bad status code', null)
         res.pipe(feedparser)
       })
 
       // feedparser events
       feedparser.on('error', done)
+
       feedparser.on('end', () => {
-        context.dataCache.cacheResponse(JSON.stringify(items), () => {})
-        done(null, items)
+        const cacheOptions = {
+          name: this.datasource.name,
+          caching: this.schema.datasource.caching,
+          cacheKey: this.cacheKey
+        }
+
+        context.dataCache.cacheResponse(
+          cacheOptions,
+          JSON.stringify(items),
+          () => {}
+        )
+        return done(null, items)
       })
+
       feedparser.on('readable', function () {
         let item
         while ((item = this.read())) {

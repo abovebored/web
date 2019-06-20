@@ -1,41 +1,63 @@
 /**
  * @module Event
  */
-var fs = require('fs')
-var path = require('path')
+const path = require('path')
+const log = require('@dadi/logger')
 
-var log = require('@dadi/logger')
-
-var Event = function (pageName, eventName, options) {
-  // if (!pageName) throw new Error('Page name required')
+const Event = function (pageName, eventName, options) {
   this.page = pageName
   this.name = eventName
   this.options = options || {}
 }
 
 Event.prototype.loadEvent = function () {
-  var filepath = path.join(this.options.eventPath, this.name + '.js')
-
-  if (filepath && !fs.existsSync(filepath)) {
-    throw new Error('Page "' + this.page + '" references event "' + this.name + '" which can\'t be found in "' + this.options.eventPath + '"')
-  }
+  const filepath = path.join(this.options.eventPath, this.name + '.js')
 
   try {
     // get the event
     return require(filepath)
   } catch (err) {
-    throw err
+    throw new Error(
+      `Page "${this.page}" references event "${
+        this.name
+      }" which can't be found in "${this.options.eventPath}"`
+    )
   }
 }
 
 Event.prototype.run = function (req, res, data, done) {
-  this.loadEvent()(req, res, data, function (err, result) {
-    if (err) {
-      log.error({module: 'event'}, err)
-    }
+  try {
+    this.loadEvent()(req, res, data, (err, result) => {
+      if (err) {
+        log.error(
+          {
+            module: 'event',
+            event: this.name,
+            page: this.page,
+            url: req.url,
+            params: req.params,
+            options: this.options
+          },
+          err
+        )
+      }
 
-    return done(err, result)
-  })
+      return done(err, result)
+    })
+  } catch (err) {
+    log.error(
+      {
+        module: 'event',
+        event: this.name,
+        page: this.page,
+        url: req.url,
+        params: req.params,
+        options: this.options
+      },
+      err
+    )
+    return done(null, null)
+  }
 }
 
 module.exports = function (pageName, eventName, options) {

@@ -1,252 +1,319 @@
-var path = require('path')
-var should = require('should')
-var sinon = require('sinon')
+const path = require('path')
+const should = require('should')
 
-var api = require(__dirname + '/../../dadi/lib/api')
-var Server = require(__dirname + '/../../dadi/lib')
-var cache = require(__dirname + '/../../dadi/lib/cache')
-var datasource = require(__dirname + '/../../dadi/lib/datasource')
-var page = require(__dirname + '/../../dadi/lib/page')
-var TestHelper = require(__dirname + '/../help')()
-var config = require(path.resolve(path.join(__dirname, '/../../config')))
+const sinon = require('sinon')
+const sinonTest = require('sinon-test')
 
-describe('Cache', function (done) {
-  beforeEach(function(done) {
+sinon.test = sinonTest.configureTest(sinon)
+sinon.testCase = sinonTest.configureTestCase(sinon)
+
+const api = require(`${__dirname}/../../dadi/lib/api`)
+const Server = require(`${__dirname}/../help`).Server
+const cache = require(`${__dirname}/../../dadi/lib/cache`)
+const datasource = require(`${__dirname}/../../dadi/lib/datasource`)
+const page = require(`${__dirname}/../../dadi/lib/page`)
+const TestHelper = require(`${__dirname}/../help`)()
+const config = require(path.resolve(path.join(__dirname, '/../../config')))
+
+describe('Cache', done => {
+  beforeEach(done => {
     TestHelper.resetConfig().then(() => {
       done()
     })
   })
 
-  afterEach(function(done) {
+  afterEach(done => {
     TestHelper.stopServer(done)
   })
 
-  it('should be a function', function (done) {
+  it('should be a function', done => {
     cache.should.be.Function
     done()
   })
 
-  it('should take a server instance as an argument', sinon.test(function (done) {
-    var server = sinon.mock(Server)
-    server.object.app = api()
+  it(
+    "should cache if the app's config settings allow",
+    sinon.test(done => {
+      const server = sinon.mock(Server)
+      server.object.app = api()
 
-    var method = sinon.spy(server.object.app, 'use')
-    cache.reset()
-    cache(server.object).init()
-
-    method.called.should.eql(true)
-    done()
-  }))
-
-  it("should cache if the app's config settings allow", sinon.test(function (done) {
-    var server = sinon.mock(Server)
-    server.object.app = api()
-
-    var cacheConfig = {
-      caching: {
-        directory: {
-          enabled: true
+      const cacheConfig = {
+        caching: {
+          directory: {
+            enabled: true
+          }
         }
       }
-    }
 
-    TestHelper.updateConfig(cacheConfig).then(() => {
-      var e = cache(server.object).enabled
-      e.should.eql(true)
-      done()
+      TestHelper.updateConfig(cacheConfig).then(() => {
+        const e = cache(server.object).enabled
+        e.should.eql(true)
+        done()
+      })
     })
-  }))
+  )
 
-  it("should not cache if the app's config settings don't allow", sinon.test(function (done) {
-    var server = sinon.mock(Server)
-    server.object.app = api()
+  it(
+    "should not cache if the app's config settings do not allow",
+    sinon.test(done => {
+      const server = sinon.mock(Server)
+      server.object.app = api()
 
-    var cacheConfig = {
-      caching: {
-        directory: {
-          enabled: false
+      const cacheConfig = {
+        caching: {
+          directory: {
+            enabled: false
+          }
         }
       }
-    }
 
-    TestHelper.updateConfig(cacheConfig).then(() => {
-      cache(server.object).enabled.should.eql(true)
-      done()
+      TestHelper.updateConfig(cacheConfig).then(() => {
+        cache(server.object).enabled.should.eql(true)
+        done()
+      })
     })
-  }))
+  )
 
-  it("should not cache if the url key can't be found in the loaded keys", sinon.test(function (done) {
-    var server = sinon.mock(Server)
-    server.object.app = api()
+  it(
+    'should not cache if the url key can not be found in the loaded keys',
+    sinon.test(done => {
+      const server = sinon.mock(Server)
+      server.object.app = api()
 
-    server.object.components['/actualUrl'] = {
-      page: {
-        routes: [{
-          path: ['/actualUrl']
-        }],
-        settings: {
-          cache: true
+      server.object.components['/actualUrl'] = {
+        page: {
+          routes: [
+            {
+              path: ['/actualUrl']
+            }
+          ],
+          settings: {
+            cache: true
+          }
         }
       }
-    }
 
-    var req = {
-      paths: ['/fakeUrl'],
-      url: 'http://www.example.com/fakeUrl'
-    }
-
-    cache.reset()
-    cache(server.object).cachingEnabled(req).should.eql(false)
-
-    done()
-  }))
-
-  it('should cache if the url key can be found in the loaded keys and it allows caching', sinon.test(function (done) {
-    var server = sinon.mock(Server)
-    server.object.app = api()
-
-    server.object.components['/actualUrl'] = {
-      page: {
-        routes: [{
-          path: '/actualUrl'
-        }],
-        settings: {
-          cache: true
-        }
+      const req = {
+        paths: ['/fakeUrl'],
+        url: 'http://www.example.com/fakeUrl'
       }
-    }
 
-    var req = {
-      paths: ['/actualUrl'],
-      url: 'http://www.example.com/actualUrl'
-    }
-
-    var cacheConfig = {
-      caching: {
-        directory: {
-          enabled: true
-        }
-      }
-    }
-
-    TestHelper.updateConfig(cacheConfig).then(() => {
       cache.reset()
-      var c = cache(server.object)
-      c.cachingEnabled(req).should.eql(true)
+      cache(server.object)
+        .cachingEnabled(req)
+        .should.eql(false)
+
       done()
     })
-  }))
+  )
 
-  it('should not cache if the url key can be found in the loaded keys but it does not specify options', sinon.test(function (done) {
-    var server = sinon.mock(Server)
-    server.object.app = api()
+  it(
+    'should locate the component that matches the current request URL',
+    sinon.test(done => {
+      const server = sinon.mock(Server)
+      server.object.app = api()
 
-    server.object.components['/actualUrl'] = {
-      page: {
-        routes: [{
-          path: '/actualUrl'
-        }],
-        xxx: {
-          cache: false
+      server.object.components['/:anotherURL'] = {
+        page: {
+          routes: [
+            {
+              path: '/:anotherURL'
+            }
+          ],
+          settings: {
+            cache: true
+          }
         }
       }
-    }
 
-    var req = {
-      paths: ['/actualUrl'],
-      url: 'http://www.example.com/actualUrl'
-    }
-
-    cache.reset()
-    cache(server.object).cachingEnabled(req).should.eql(false)
-
-    done()
-  }))
-
-  it('should not cache if the url key can be found in the loaded keys but ?json=true exists in the query', sinon.test(function (done) {
-    var server = sinon.mock(Server)
-    server.object.app = api()
-
-    server.object.components['/actualUrl'] = {
-      page: {
-        routes: [{
-          path: ['/actualUrl']
-        }],
-        xxx: {
-          cache: false
+      server.object.components['/actualUrl'] = {
+        page: {
+          routes: [
+            {
+              path: '/actualUrl'
+            }
+          ],
+          settings: {
+            cache: true
+          }
         }
       }
-    }
 
-    var req = {
-      paths: ['/actualUrl'],
-      url: 'http://www.example.com/actualUrl?json=true'
-    }
+      const req = {
+        paths: ['/:anotherURL', '/actualUrl'],
+        url: 'http://www.example.com/actualUrl'
+      }
 
-    cache.reset()
-    cache(server.object).cachingEnabled(req).should.eql(false)
-
-    done()
-  }))
-
-  it('should cache if the url key can be found in the loaded keys and ?json=false exists in the query', sinon.test(function (done) {
-    var server = sinon.mock(Server)
-    server.object.app = api()
-
-    server.object.components['/actualUrl'] = {
-      page: {
-        routes: [{
-          path: ['/actualUrl']
-        }],
-        settings: {
-          cache: true
+      const cacheConfig = {
+        caching: {
+          directory: {
+            enabled: true
+          }
         }
       }
-    }
 
-    var req = {
-      paths: ['/actualUrl'],
-      url: 'http://www.example.com/actualUrl?json=false'
-    }
-
-    var cacheConfig = {
-      caching: {
-        directory: {
-          enabled: true
-        }
-      }
-    }
-
-    TestHelper.updateConfig(cacheConfig).then(() => {
       cache.reset()
-      var c = cache(server.object)
-      c.cachingEnabled(req).should.eql(true)
-      done()
+      const c = cache(server.object)
+      const spy = sinon.spy(c, 'getEndpointMatchingRequest')
+
+      TestHelper.updateConfig(cacheConfig).then(() => {
+        c.cachingEnabled(req)
+
+        spy.calledOnce.should.eql(true)
+        should.exist(spy.lastCall.returnValue)
+
+        spy.lastCall.returnValue.should.eql(
+          server.object.components['/actualUrl']
+        )
+        done()
+      })
     })
-  }))
+  )
 
-  it('should not cache if the url key can be found in the loaded keys but it does not allow caching', sinon.test(function (done) {
-    var server = sinon.mock(Server)
-    server.object.app = api()
+  it(
+    'should cache if the url key can be found in the loaded keys and it allows caching',
+    sinon.test(done => {
+      const server = sinon.mock(Server)
+      server.object.app = api()
 
-    server.object.components['/actualUrl'] = {
-      page: {
-        routes: [{
-          path: ['/actualUrl']
-        }],
-        settings: {
-          cache: false
+      server.object.components['/actualUrl'] = {
+        page: {
+          routes: [
+            {
+              path: '/actualUrl'
+            }
+          ],
+          settings: {
+            cache: true
+          }
         }
       }
-    }
 
-    var req = {
-      paths: ['/actualUrl'],
-      url: 'http://www.example.com/actualUrl'
-    }
+      const req = {
+        paths: ['/actualUrl'],
+        url: 'http://www.example.com/actualUrl'
+      }
 
-    cache.reset()
-    cache(server.object).cachingEnabled(req).should.eql(false)
-    done()
-  }))
+      const cacheConfig = {
+        caching: {
+          directory: {
+            enabled: true
+          }
+        }
+      }
+
+      TestHelper.updateConfig(cacheConfig).then(() => {
+        cache.reset()
+        const c = cache(server.object)
+        c.cachingEnabled(req).should.eql(true)
+        done()
+      })
+    })
+  )
+
+  it(
+    'should not cache if the url key can be found in the loaded keys but ?debug=json exists in the query',
+    sinon.test(done => {
+      const server = sinon.mock(Server)
+      server.object.app = api()
+
+      server.object.components['/actualUrl'] = {
+        page: {
+          routes: [
+            {
+              path: '/actualUrl'
+            }
+          ],
+          xxx: {
+            cache: false
+          }
+        }
+      }
+
+      const req = {
+        paths: ['/actualUrl'],
+        url: 'http://www.example.com/actualUrl?debug=json'
+      }
+
+      cache.reset()
+      cache(server.object)
+        .cachingEnabled(req)
+        .should.eql(false)
+
+      done()
+    })
+  )
+
+  it(
+    'should cache if the url key can be found in the loaded keys and ?json=false exists in the query',
+    sinon.test(done => {
+      const server = sinon.mock(Server)
+      server.object.app = api()
+
+      server.object.components['/actualUrl'] = {
+        page: {
+          routes: [
+            {
+              path: '/actualUrl'
+            }
+          ],
+          settings: {
+            cache: true
+          }
+        }
+      }
+
+      const req = {
+        paths: ['/actualUrl'],
+        url: 'http://www.example.com/actualUrl?json=false'
+      }
+
+      const cacheConfig = {
+        caching: {
+          directory: {
+            enabled: true
+          }
+        }
+      }
+
+      TestHelper.updateConfig(cacheConfig).then(() => {
+        cache.reset()
+        const c = cache(server.object)
+        c.cachingEnabled(req).should.eql(true)
+        done()
+      })
+    })
+  )
+
+  it(
+    'should not cache if the url key can be found in the loaded keys but it does not allow caching',
+    sinon.test(done => {
+      const server = sinon.mock(Server)
+      server.object.app = api()
+
+      server.object.components['/actualUrl'] = {
+        page: {
+          routes: [
+            {
+              path: '/actualUrl'
+            }
+          ],
+          settings: {
+            cache: false
+          }
+        }
+      }
+
+      const req = {
+        paths: ['/actualUrl'],
+        url: 'http://www.example.com/actualUrl'
+      }
+
+      cache.reset()
+      cache(server.object)
+        .cachingEnabled(req)
+        .should.eql(false)
+      done()
+    })
+  )
 })

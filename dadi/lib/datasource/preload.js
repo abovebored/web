@@ -1,27 +1,33 @@
-var _ = require('underscore')
-var path = require('path')
+const path = require('path')
 
-var config = require(path.resolve(path.join(__dirname, '/../../../config')))
-var Datasource = require(path.join(__dirname, '/../datasource'))
+const config = require(path.resolve(path.join(__dirname, '/../../../config')))
+const Datasource = require(path.join(__dirname, '/../datasource'))
+const Providers = require(path.join(__dirname, '/../providers'))
 
-var Preload = function () {
+const Preload = function () {
   this.data = {}
 }
 
 Preload.prototype.init = function (options) {
   this.sources = config.get('data.preload')
 
-  _.each(this.sources, (source) => {
+  this.sources.forEach(source => {
     new Datasource(null, source, options).init((err, datasource) => {
       if (err) {
         console.log(err)
         return
       }
 
-      datasource.provider.load(null, (err, result) => {
+      datasource.provider = new Providers[datasource.source.type]()
+      datasource.provider.initialise(datasource, datasource.schema)
+
+      datasource.provider.load(null, (err, data) => {
         if (err) console.log(err)
-        if (result) {
-          var results = (typeof result === 'object' ? result : JSON.parse(result))
+
+        datasource.provider = null
+
+        if (data) {
+          const results = data
           this.data[source] = results.results ? results.results : results
         }
       })
@@ -44,7 +50,7 @@ Preload.prototype.reset = function () {
   this.sources = []
 }
 
-var instance
+let instance
 module.exports = function () {
   if (!instance) {
     instance = new Preload()

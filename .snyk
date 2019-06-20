@@ -1,8 +1,25 @@
 # Snyk (https://snyk.io) policy file, patches or ignores known vulnerabilities.
-version: v1.7.0
+version: v1.12.0
 ignore: {}
 # patches apply the minimum changes required to fix a vulnerability
 patch:
   'npm:marked:20170112':
     - marked:
         patched: '2017-02-10T14:26:06.244Z'
+    - '@dadi/dustjs-helpers > marked':
+        patched: '2017-08-10T07:06:49.836Z'
+  'npm:ms:20170412':
+    - compression > debug > ms:
+        patched: '2017-05-24T07:54:07.419Z'
+  'npm:marked:20170907':
+    - marked:
+        patched: '2017-11-01T07:54:14.421Z'
+    - '@dadi/dustjs-helpers > marked':
+        patched: '2017-11-01T07:54:14.421Z'
+  'npm:lodash:20180130':
+    - '@dadi/logger > aws-kinesis-writable > lodash':
+        patched: '2018-07-04T06:27:25.690Z'
+    - '@dadi/boot > cli-table2 > lodash':
+        patched: '2018-07-04T06:27:25.690Z'
+    - web-es6-templates > @dadi/logger > aws-kinesis-writable > lodash:
+        patched: '2018-07-04T06:27:25.690Z'

@@ -1,57 +1,66 @@
+'use strict'
+
 /**
  * @module Controller
  */
-var _ = require('underscore')
-var async = require('async')
-var crypto = require('crypto')
-var path = require('path')
-var url = require('url')
+const async = require('async')
+const clone = require('clone')
+const debug = require('debug')('web:controller')
+const getValue = require('get-value')
+const path = require('path')
+const url = require('url')
 
-var config = require(path.join(__dirname, '/../../../config.js'))
-var help = require(path.join(__dirname, '/../help'))
-var log = require('@dadi/logger')
+const config = require(path.join(__dirname, '/../../../config.js'))
+const help = require(path.join(__dirname, '/../help'))
+const log = require('@dadi/logger')
 
-var Datasource = require(path.join(__dirname, '/../datasource'))
-var Event = require(path.join(__dirname, '/../event'))
-var View = require(path.join(__dirname, '/../view'))
-
-// helpers
-var sendBackHTML = help.sendBackHTML
-var sendBackJSON = help.sendBackJSON
+const Datasource = require(path.join(__dirname, '/../datasource'))
+const Event = require(path.join(__dirname, '/../event'))
+const Providers = require(path.join(__dirname, '/../providers'))
+const View = require(path.join(__dirname, '/../view'))
+const DebugView = require(path.join(__dirname, '/../debug'))
+const Send = require(path.join(__dirname, '/../view/send'))
+const Cache = require(path.join(__dirname, '/../cache'))
 
 /**
  *
  */
-var Controller = function (page, options, meta) {
+const Controller = function (page, options, meta, engine, cache) {
   if (!page) throw new Error('Page instance required')
 
   this.page = page
 
   this.options = options || {}
   this.meta = meta || {}
+  this.engine = engine
+  this.cacheLayer = Cache(cache)
 
   this.datasources = {}
   this.events = []
   this.preloadEvents = []
 
-  this.attachDatasources((err) => {
+  this.page.globalPostProcessors = config.get('globalPostProcessors') || []
+  this.page.globalEvents = config.get('globalEvents') || []
+
+  this.attachDatasources(err => {
     if (err) {
-      log.error({module: 'controller'}, err)
+      log.error({ module: 'controller' }, err)
       throw err
     }
   })
 
-  this.attachEvents(() => {
-  })
+  this.attachEvents(() => {})
 }
 
 /**
  *
  */
 Controller.prototype.attachDatasources = function (done) {
-  var i = 0
+  if (this.page.datasources.length === 0) return done(null)
 
-  this.page.datasources.forEach((datasource) => {
+  let i = 0
+
+  this.page.datasources.forEach(datasource => {
     new Datasource(this.page, datasource, this.options).init((err, ds) => {
       if (err) return done(err)
 
@@ -68,33 +77,61 @@ Controller.prototype.attachDatasources = function (done) {
  *
  */
 Controller.prototype.attachEvents = function (done) {
-  // add global events first
-  config.get('globalEvents').forEach((eventName) => {
-    var e = new Event(this.page.name, eventName, this.options)
-    this.preloadEvents.push(e)
+  let event
+
+  this.page.preloadEvents.forEach(eventName => {
+    event = new Event(this.page.name, eventName, this.options)
+    this.preloadEvents.push(event)
   })
 
-  this.page.preloadEvents.forEach((eventName) => {
-    var e = new Event(this.page.name, eventName, this.options)
-    this.preloadEvents.push(e)
-  })
-
-  this.page.events.forEach((eventName) => {
-    var e = new Event(this.page.name, eventName, this.options)
-    this.events.push(e)
+  this.page.events.concat(this.page.globalEvents).forEach(eventName => {
+    event = new Event(this.page.name, eventName, this.options)
+    this.events.push(event)
   })
 
   done()
 }
 
 /**
+ * Checks the supplied data object for results for each of the current page's "requiredDatasources"
  *
+ * @param {Object} data - the data loaded by the datasources and events
+ * @returns {Boolean} - false if at least one required datasource has no results, otherwise true
  */
 Controller.prototype.requiredDataPresent = function (data) {
-  if (_.isEmpty(this.page.requiredDatasources)) return true
+  if (!data) return false
+  if (this.page.requiredDatasources.length === 0) return true
 
-  return _.every(this.page.requiredDatasources, function (datasource) {
-    return data.hasOwnProperty(datasource) && data[datasource].hasOwnProperty('results') && data[datasource].results.length !== 0
+  return this.page.requiredDatasources.every(datasource => {
+    // data doesn't exist
+    if (!data[datasource]) return false
+
+    const content = data[datasource]
+
+    if (Array.isArray(content)) {
+      // it's an empty array
+      if (content.length === 0) {
+        return false
+      }
+    } else {
+      // it's an object with no properties
+      if (Object.keys(content).length === 0) {
+        return false
+      }
+    }
+
+    // it's an empty results array (likely from DADI API)
+    if (
+      content.results &&
+      Array.isArray(content.results) &&
+      content.results.length === 0
+    ) {
+      return false
+    }
+
+    // it's an object with properties, an array with at least one item, or
+    // an object containing a "results" array with at least one item
+    return true
   })
 }
 
@@ -102,7 +139,7 @@ Controller.prototype.requiredDataPresent = function (data) {
  *
  */
 Controller.prototype.buildInitialViewData = function (req) {
-  var data = {}
+  let data = {}
 
   // data helpers
   data.has = function (node) {
@@ -110,40 +147,66 @@ Controller.prototype.buildInitialViewData = function (req) {
   }
 
   data.hasResults = function (node) {
-    return this.has(node) && this[node].results !== undefined && !_.isEmpty(this[node].results)
+    return (
+      this.has(node) &&
+      this[node].results !== undefined &&
+      this[node].results.length > 0
+    )
   }
 
-  var urlData = url.parse(req.url, true)
+  const urlData = url.parse(
+    `${req.protocol}://${(req.headers.host || req.headers[':authority'])}${req.url}`,
+    true
+  )
 
   data.query = urlData.query
   data.params = {}
-  data.pathname = ''
-  data.host = req.headers.host
   data.page = this.meta
+  data.page.name = this.page.name
 
-  if (urlData.pathname.length) data.pathname = urlData.pathname
+  data.url = {
+    protocol: urlData.protocol,
+    hostname: urlData.hostname,
+    host: urlData.host,
+    port: urlData.port,
+    path: urlData.path,
+    pathname: urlData.pathname,
+    href: urlData.href
+  }
 
   // add request params (params from the path, e.g. /:make/:model)
-  _.extend(data.params, req.params)
-
   // add query params (params from the querystring, e.g. /reviews?page=2)
-  _.extend(data.params, data.query)
+  data.params = Object.assign({}, req.params, data.query)
 
   if (req.error) data.error = req.error
 
   // add id component from the request
   if (req.params.id) data.id = decodeURIComponent(req.params.id)
 
-  // allow JSON view using ?json=true
-  var json = config.get('allowJsonView') && urlData.query.json && urlData.query.json.toString() === 'true'
+  // allow debug view using ?debug
+  data.debugView = false
 
-  data.title = this.page.name
+  if (
+    config.get('allowDebugView') &&
+    typeof urlData.query.debug !== 'undefined'
+  ) {
+    data.debugView = urlData.query.debug || true
+  }
+
+  // Legacy ?json=true
+  if (config.get('allowDebugView') && urlData.query.json) {
+    data.debugView = 'json'
+  }
+
   data.global = config.has('global') ? config.get('global') : {} // global values from config
   data.debug = config.get('debug')
-  data.json = json || false
 
-  delete data.query.json
-  delete data.params.json
+  if (config.get('security.csrf')) {
+    data.csrfToken = req.csrfToken()
+  }
+
+  delete data.query.debug
+  delete data.params.debug
 
   return data
 }
@@ -152,60 +215,52 @@ Controller.prototype.buildInitialViewData = function (req) {
  *
  */
 Controller.prototype.process = function process (req, res, next) {
+  debug('%s %s', req.method, req.url)
   help.timer.start(req.method.toLowerCase())
 
-  var self = this
-  var done
+  let data = this.buildInitialViewData(req)
 
-  var statusCode = res.statusCode || 200
+  const statusCode = res.statusCode || 200
+  const view = new View(req.url, this.page)
 
-  var data = this.buildInitialViewData(req)
-  var view = new View(req.url, self.page, data.json)
+  let done = Send.html(req, res, next, statusCode, this.page.contentType)
 
-  if (data.json) {
-    done = sendBackJSON(statusCode, res, next)
-  } else {
-    done = sendBackHTML(req.method, statusCode, this.page.contentType, res, next)
-  }
-
-  self.loadData(req, res, data, function (err, data, dsResponse) {
-    // return 404 if requiredDatasources contain no data
-    if (!self.requiredDataPresent(data)) {
-      return next()
-    }
-
+  this.loadData(req, res, data, (err, loadedData, dsResponse) => {
     if (err) {
       if (err.statusCode && err.statusCode === 404) return next()
       return done(err)
     }
 
+    // return 404 if requiredDatasources contain no data
+    if (!this.requiredDataPresent(loadedData)) {
+      return next()
+    }
+
     // If we received a response back from the datasource, and
     // not just the data, send the whole response back
-    if (dsResponse) {
-      if (dsResponse.statusCode === 202) {
-        done = sendBackJSON(dsResponse.statusCode, res, next)
-        return done(null, data)
-      }
+    if (dsResponse && dsResponse.statusCode === 202) {
+      done = Send.json(dsResponse.statusCode, res, next)
+      return done(null, loadedData)
     }
 
     help.timer.stop(req.method.toLowerCase())
-    if (data) data.stats = help.timer.getStats()
 
-    if (data.json) {
-      return done(null, data)
-    }
+    view.setData(loadedData)
 
-    view.setData(data)
-
-    view.render(function (err, result) {
+    view.render((err, result, unprocessed) => {
       if (err) return next(err)
-      return done(null, result)
+
+      if (data.debugView) {
+        return DebugView(req, res, next, view, this)(null, result, unprocessed)
+      } else {
+        return done(null, result)
+      }
     })
   })
 }
 
 function hasAttachedDatasources (datasources) {
-  return (typeof datasources === 'object' && Object.keys(datasources).length > 0)
+  return typeof datasources === 'object' && Object.keys(datasources).length > 0
 }
 
 /**
@@ -235,209 +290,245 @@ Controller.prototype.loadEventData = function (events, req, res, data, done) {
     return done(null, data)
   }
 
-  var eventIdx = 0
+  let queue = Promise.resolve(true)
 
-  _.each(events, function (event) {
-    help.timer.start('event: ' + event.name)
+  events.forEach(event => {
+    queue = queue.then(() => {
+      return new Promise((resolve, reject) => {
+        help.timer.start('event: ' + event.name)
 
-    // add a random value to the data obj so we can check if an
-    // event has sent back the obj - in which case we assign it back
-    // to itself
-    var checkValue = crypto.createHash('md5').update(new Date().toString()).digest('hex')
-    data.checkValue = checkValue
+        // add a random value to the data obj so we can check if an
+        // event has sent back the obj - in which case we assign it back
+        // to itself
+        data.timestamp = new Date().getTime()
 
-    // run the event
-    try {
-      event.run(req, res, data, function (err, result) {
-        help.timer.stop('event: ' + event.name)
+        event.run(req, res, data, (err, result) => {
+          help.timer.stop('event: ' + event.name)
 
-        if (err) {
-          return done(err, data)
-        }
+          if (err) return reject(err)
 
-        // if we get data back with the same checkValue property,
-        // reassign it to our global data object to avoid circular JSON
-        if (result && result.checkValue && result.checkValue === checkValue) {
-          data = result
-        } else if (result) {
-          // add the result to our global data object
-          data[event.name] = result
-        }
+          // if we get data back with the same timestamp property,
+          // reassign it to our global data object to avoid circular JSON
+          if (
+            result &&
+            result.timestamp &&
+            result.timestamp === data.timestamp
+          ) {
+            data = result
+          } else if (result) {
+            // add the result to our global data object
+            data[event.name] = result
+          }
 
-        eventIdx++
-
-        // return the data if we're at the end of the events
-        // array, we have all the responses to render the page
-        if (eventIdx === events.length) {
-          return done(null, data)
-        }
+          return resolve(data)
+        })
       })
-    } catch (err) {
-      return done(err, data)
-    }
+    })
   })
+
+  return queue.then(() => done(null, data)).catch(err => done(err))
 }
 
 Controller.prototype.loadData = function (req, res, data, done) {
-  var self = this
+  const self = this
 
-  var primaryDatasources = {}
-  var chainedDatasources = {}
-  _.each(self.datasources, function (ds, key) {
+  const primaryDatasources = {}
+  const chainedDatasources = {}
+
+  debug('datasources %o', Object.keys(this.datasources))
+
+  Object.keys(this.datasources).forEach(key => {
+    let ds = this.datasources[key]
+
     if (ds.chained) {
-      chainedDatasources[key] = ds
+      chainedDatasources[key] = clone(ds)
     } else {
-      primaryDatasources[key] = ds
+      primaryDatasources[key] = clone(ds)
     }
   })
 
+  debug(
+    'loadData %o %o',
+    Object.keys(primaryDatasources),
+    Object.keys(chainedDatasources)
+  )
+
   help.timer.start('load data')
 
-  async.waterfall([
-    // Run PreLoad Events
-    function (callback) {
-      help.timer.start('preload data')
-      self.loadEventData(self.preloadEvents, req, res, data, function (err, result) {
-        if (err) return done(err)
-        help.timer.stop('preload data')
-        callback(null)
-      })
-    },
-
-    // Run datasources
-    function (callback) {
-      if (!hasAttachedDatasources(self.datasources)) {
-        callback(null)
-      }
-
-      var queue = async.queue(function (ds, cb) {
-        if (ds.filterEvent) {
-          ds.filterEvent.run(req, res, data, function (err, filter) {
+  async.waterfall(
+    [
+      // Run PreLoad Events
+      function (callback) {
+        help.timer.start('preload data')
+        self.loadEventData(
+          self.preloadEvents,
+          req,
+          res,
+          data,
+          (err, result) => {
             if (err) return done(err)
-            ds.schema.datasource.filterEventResult = filter
-          })
+            help.timer.stop('preload data')
+            callback(null)
+          }
+        )
+      },
+
+      // Run datasources
+      function (callback) {
+        if (!hasAttachedDatasources(self.datasources)) {
+          callback(null)
         }
 
-        processSearchParameters(ds.schema.datasource.key, ds, req)
-
-        help.timer.start('datasource: ' + ds.name)
-
-        ds.provider.load(req.url, function (err, result, dsResponse) {
-          help.timer.stop('datasource: ' + ds.name)
-          if (err) return done(err)
-
-          if (dsResponse) {
-            return done(null, result, dsResponse)
+        let queue = async.queue((ds, cb) => {
+          if (ds.endpointEvent) {
+            ds.endpointEvent.run(req, res, data, (err, endpoint) => {
+              if (err) return done(err)
+              ds.schema.datasource.source.endpoint = endpoint
+            })
           }
 
-          if (result) {
-            try {
-              data[ds.schema.datasource.key] = (typeof result === 'object' ? result : JSON.parse(result))
-            } catch (e) {
-              console.log(e)
-            }
+          if (ds.filterEvent) {
+            ds.filterEvent.run(req, res, data, (err, filter) => {
+              if (err) return done(err)
+              ds.schema.datasource.filterEventResult = filter
+            })
           }
 
-          cb()
+          help.timer.start('datasource: ' + ds.name)
+
+          ds.provider = new Providers[ds.source.type]()
+          ds.provider.initialise(ds, ds.schema)
+
+          processSearchParameters(ds.schema.datasource.key, ds, req)
+
+          /**
+           * Call the data provider's load method to obtain data
+           * for this datasource
+           * @returns err, {Object} result, {Object} dsResponse
+           */
+          ds.provider.load(req.url, (err, result, dsResponse) => {
+            if (err) return done(err)
+
+            help.timer.stop('datasource: ' + ds.name)
+
+            ds.provider = null
+
+            if (dsResponse) return done(null, result, dsResponse)
+
+            if (result) data[ds.schema.datasource.key] = result
+
+            cb()
+          })
+        }, 1)
+
+        // queue finished
+        queue.drain = function () {
+          callback(null)
+        }
+
+        // add each primary datasource to the queue for processing
+        Object.keys(primaryDatasources).forEach(key => {
+          queue.push(primaryDatasources[key])
         })
-      }, 1)
+      },
 
-      // queue finished
-      queue.drain = function () {
-        callback(null)
+      // Run chained datasources
+      function (callback) {
+        self.processChained(chainedDatasources, data, req, (err, result) => {
+          if (err) return done(err)
+          callback(null)
+        })
+      },
+
+      // Run events
+      function (callback) {
+        self.loadEventData(self.events, req, res, data, (err, result) => {
+          if (err) return done(err)
+          callback(null)
+        })
       }
-
-      // add each primary datasource to the queue for processing
-      _.each(primaryDatasources, function (datasource) {
-        queue.push(datasource)
-      })
-    },
-
-    // Run chained datasources
-    function (callback) {
-      self.processChained(chainedDatasources, data, req, function (err, result) {
-        if (err) return done(err)
-        callback(null)
-      })
-    },
-
-    // Run events
-    function (callback) {
-      self.loadEventData(self.events, req, res, data, function (err, result) {
-        if (err) return done(err)
-        callback(null)
-      })
-    }
-  ],
-
+    ],
     // final results
     function (err) {
       help.timer.stop('load data')
       done(err, data)
-    })
+    }
+  )
 }
 
-Controller.prototype.processChained = function (chainedDatasources, data, req, done) {
-  var idx = 0
-  var self = this
+Controller.prototype.processChained = function (
+  chainedDatasources,
+  data,
+  req,
+  done
+) {
+  let idx = 0
 
   if (Object.keys(chainedDatasources).length === 0) {
     return done(null, data)
   }
 
-  _.each(chainedDatasources, function (chainedDatasource, chainedKey) {
+  Object.keys(chainedDatasources).forEach(chainedKey => {
+    let chainedDatasource = chainedDatasources[chainedKey]
+    let datasourceToLocate = chainedDatasource.chained.datasource
+
+    debug('datasource (chained): %s > %s', datasourceToLocate, chainedKey)
+
     help.timer.start('datasource: ' + chainedDatasource.name + ' (chained)')
 
-    if (!data[chainedDatasource.chained.datasource]) {
-      var message = "Chained datasource '" + chainedDatasource.name + "' expected to find data from datasource '" + chainedDatasource.chained.datasource + "'."
-      var err = new Error()
+    if (!data[datasourceToLocate]) {
+      const message =
+        "Chained datasource '" +
+        chainedDatasource.name +
+        "' expected to find data from datasource '" +
+        datasourceToLocate +
+        "'."
+      let err = new Error()
       err.message = message
-      log.warn({module: 'controller'}, message)
+      log.warn({ module: 'controller' }, message)
       return done(err)
     }
 
     // find the value of the parameter in the returned data
     // to use in the chained datasource
-    var param = ''
-
-    try {
-      param =
-        chainedDatasource.chained.outputParam.param.split('.').reduce(function (o, x) {
-          return o ? o[x] : ''
-        }, data[chainedDatasource.chained.datasource])
-    } catch (e) {
-      return done(e)
-    }
-
-    // cast the param value if needed
-    if (chainedDatasource.chained.outputParam.type && chainedDatasource.chained.outputParam.type === 'Number') {
-      param = parseInt(param)
-    } else {
-      param = encodeURIComponent(param)
-    }
+    let outputParam = chainedDatasource.chained.outputParam
+    let param = this.getParameterValue(data[datasourceToLocate], outputParam)
 
     // does the parent page require no cache?
     if (data.query.cache === 'false') {
       chainedDatasource.schema.datasource.cache = false
     }
 
-    if (self.page.passFilters && chainedDatasource.schema.datasource.paginate) {
-      chainedDatasource.schema.datasource.page = data.query.page || req.params.page || 1
+    if (this.page.passFilters && chainedDatasource.schema.datasource.paginate) {
+      chainedDatasource.schema.datasource.page =
+        data.query.page || req.params.page || 1
     }
 
-    // if there is a field to filter on, add the new parameter value to the filters
-    if (chainedDatasource.chained.outputParam.field) {
-      chainedDatasource.schema.datasource.filter[chainedDatasource.chained.outputParam.field] = param
+    // if the outputParam has no 'target' property,
+    // it's destined for the filter
+    outputParam.target = outputParam.target || 'filter'
+
+    let endpoint = chainedDatasource.schema.datasource.source.endpoint
+
+    if (outputParam.field && param) {
+      if (outputParam.target === 'endpoint') {
+        const placeholderRegex = new RegExp('{' + outputParam.field + '}', 'ig')
+        endpoint = endpoint.replace(placeholderRegex, param)
+      } else {
+        chainedDatasource.schema.datasource.filter[outputParam.field] = param
+      }
     }
+
+    chainedDatasource.schema.datasource.source.endpoint = endpoint
 
     // if the datasource specified a query, add it to the existing filter
     // by looking for the placeholder value
-    if (chainedDatasource.chained.outputParam.query) {
-      var placeholder = '"{' + chainedDatasource.chained.datasource + '}"'
-      var filter = JSON.stringify(chainedDatasource.schema.datasource.filter)
-      var q = JSON.stringify(chainedDatasource.chained.outputParam.query)
+    if (outputParam.query) {
+      const placeholder = '"{' + chainedDatasource.chained.datasource + '}"'
+      let filter = JSON.stringify(chainedDatasource.schema.datasource.filter)
+      let q = JSON.stringify(outputParam.query)
 
-      if (typeof (param) !== 'number') {
+      if (typeof param !== 'number') {
         param = '"' + param + '"'
       }
 
@@ -448,18 +539,33 @@ Controller.prototype.processChained = function (chainedDatasources, data, req, d
       chainedDatasource.schema.datasource.filter = JSON.parse(filter)
     }
 
-    // needed?
-    // chainedDatasource.provider.buildEndpoint(chainedDatasource.schema, function() {})
-    chainedDatasource.provider.load(req.url, function (err, result) {
-      if (err) log.error({module: 'controller'}, err)
+    chainedDatasource.provider = new Providers[chainedDatasource.source.type]()
+    chainedDatasource.provider.initialise(
+      chainedDatasource,
+      chainedDatasource.schema
+    )
+
+    chainedDatasource.provider.buildEndpoint(
+      chainedDatasource.schema.datasource
+    )
+
+    debug(
+      'datasource (load): %s %s',
+      chainedDatasource.name,
+      chainedDatasource.provider.endpoint
+    )
+
+    chainedDatasource.provider.load(req.url, (err, chainedData) => {
+      if (err) log.error({ module: 'controller' }, err)
 
       help.timer.stop('datasource: ' + chainedDatasource.name + ' (chained)')
 
-      if (result) {
+      // TODO: simplify this, doesn't require a try/catch
+      if (chainedData) {
         try {
-          data[chainedKey] = (typeof result === 'object' ? result : JSON.parse(result))
+          data[chainedKey] = chainedData
         } catch (e) {
-          log.error({module: 'controller'}, e)
+          log.error({ module: 'controller' }, e)
         }
       }
 
@@ -472,14 +578,36 @@ Controller.prototype.processChained = function (chainedDatasources, data, req, d
   })
 }
 
+/**
+ * Gets the value of the specified parameter from the specified source
+ *
+ * @param {Object} object - the object that holds the data to be searched
+ * @param {Object} parameter - contains the type and path of the required parameter
+ * @returns {String|Number} the value associated with the specified parameter, or null
+ */
+Controller.prototype.getParameterValue = function (object, parameter) {
+  let value = null
+  value = getValue(object, parameter.param)
+
+  if (value) {
+    if (parameter.type && parameter.type === 'Number') {
+      value = Number(value)
+    } else {
+      value = encodeURIComponent(value)
+    }
+  }
+
+  return value
+}
+
 function processSearchParameters (key, datasource, req) {
   // process each of the datasource's requestParams, testing for their existence
   // in the querystring's request params e.g. /car-reviews/:make/:model
   datasource.processRequest(key, req)
 }
 
-module.exports = function (page, options, meta) {
-  return new Controller(page, options, meta)
+module.exports = function (page, options, meta, engine) {
+  return new Controller(page, options, meta, engine)
 }
 
 module.exports.Controller = Controller

@@ -1,6 +1,7 @@
 'use strict'
 
-const _ = require('underscore')
+const path = require('path')
+const help = require(path.join(__dirname, '../help'))
 
 const StaticProvider = function () {}
 
@@ -17,32 +18,6 @@ StaticProvider.prototype.initialise = function initialise (datasource, schema) {
 }
 
 /**
- * processSortParameter
- *
- * @param  {?} obj - sort parameter
- * @return {?}
- */
-StaticProvider.prototype.processSortParameter = function processSortParameter (obj) {
-  let sort = {}
-
-  if (typeof obj !== 'object' || obj === null) return sort
-
-  if (_.isArray(obj)) {
-    _.each(obj, (value, key) => {
-      if (typeof value === 'object' && value.hasOwnProperty('field') && value.hasOwnProperty('order')) {
-        sort[value.field] = (value.order === 'asc') ? 1 : -1
-      }
-    })
-  } else if (obj.hasOwnProperty('field') && obj.hasOwnProperty('order')) {
-    sort[obj.field] = (obj.order === 'asc') ? 1 : -1
-  } else {
-    sort = obj
-  }
-
-  return sort
-}
-
-/**
  * load - loads data form the datasource
  *
  * @param  {string} requestUrl - url of the web request (not used)
@@ -50,33 +25,71 @@ StaticProvider.prototype.processSortParameter = function processSortParameter (o
  * @return {void}
  */
 StaticProvider.prototype.load = function load (requestUrl, done) {
-  try {
-    let data = this.schema.datasource.source.data
+  let data = this.schema.datasource.source.data
 
-    this.schema.datasource.sort = this.processSortParameter(this.schema.datasource.sort)
+  const params = this.datasourceParams
+    ? this.datasourceParams
+    : this.schema.datasource
 
-    if (_.isArray(data)) {
-      const sortField = this.schema.datasource.sort.field
-      const sortDir = this.schema.datasource.sort.order
-      const search = this.schema.datasource.search
-      const count = this.schema.datasource.count
-      const fields = this.schema.datasource.fields || []
+  if (Array.isArray(data)) {
+    const sort = params.sort
+    const search = params.search
+    const count = params.count
+    const fields = params.fields || []
 
-      if (search) data = _.where(data, search)
+    // apply search
+    data = help.where(data, search)
 
-      // apply a filter
-      data = _.where(data, this.schema.datasource.filter)
+    // apply filter
+    data = help.where(data, params.filter)
 
-      if (sortField) data = _.sortBy(data, sortField)
-      if (sortDir === 'desc') data = data.reverse()
-      if (count) data = _.first(data, count)
-      if (fields && !_.isEmpty(fields)) data = _.chain(data).selectFields(fields.join(',')).value()
+    // Sort by field (with date support)
+    if (sort && Object.keys(sort).length > 0) {
+      Object.keys(sort).forEach(field => {
+        data.sort(
+          help.sortBy(field, value => {
+            if (field.toLowerCase().includes('date')) {
+              value = new Date(value)
+            }
+
+            return value
+          })
+        )
+
+        if (sort[field] === -1) {
+          data.reverse()
+        }
+      })
     }
 
-    done(null, { results: _.isArray(data) ? data : [data] })
-  } catch (ex) {
-    done(ex, null)
+    if (count) {
+      data = data.slice(0, count)
+    }
+
+    if (fields && fields.length > 0) {
+      if (Array.isArray(data)) {
+        let i = 0
+        data.forEach(document => {
+          data[i] = help.pick(data[i], fields)
+          i++
+        })
+      } else {
+        data = help.pick([data], fields)
+      }
+    }
   }
+
+  done(null, { results: Array.isArray(data) ? data : [data] })
+}
+
+/**
+ * processRequest - called on every request, rebuild buildEndpoint
+ *
+ * @param  {obj} req - web request object
+ * @return {void}
+ */
+StaticProvider.prototype.processRequest = function (datasourceParams) {
+  this.datasourceParams = datasourceParams
 }
 
 module.exports = StaticProvider

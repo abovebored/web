@@ -1,19 +1,22 @@
 'use strict'
 
-const _ = require('underscore')
-const url = require('url')
 const http = require('http')
 const https = require('https')
+const http2 = require('http2')
+
+const debug = require('debug')('web:provider:remote')
+const url = require('url')
 const path = require('path')
 const zlib = require('zlib')
 
-const config = require(path.join(__dirname, '/../../../config.js'))
 const log = require('@dadi/logger')
-const help = require(path.join(__dirname, '/../help'))
-const BearerAuthStrategy = require(path.join(__dirname, '/../auth/bearer'))
 const DatasourceCache = require(path.join(__dirname, '/../cache/datasource'))
 
-const RemoteProvider = function () {}
+const help = require(path.join(__dirname, '../help'))
+
+const RemoteProvider = function () {
+  this.dataCache = new DatasourceCache()
+}
 
 /**
  * initialise - initialises the datasource provider
@@ -22,11 +25,11 @@ const RemoteProvider = function () {}
  * @param  {obj} schema - the schema that this provider works with
  * @return {void}
  */
-RemoteProvider.prototype.initialise = function initialise (datasource, schema) {
+RemoteProvider.prototype.initialise = function (datasource, schema) {
   this.datasource = datasource
   this.schema = schema
-  this.setAuthStrategy()
   this.buildEndpoint()
+  this.redirects = 0
 }
 
 /**
@@ -34,18 +37,341 @@ RemoteProvider.prototype.initialise = function initialise (datasource, schema) {
  *
  * @return {void}
  */
-RemoteProvider.prototype.buildEndpoint = function buildEndpoint () {
-  const apiConfig = config.get('api')
-  const source = this.schema.datasource.source
+RemoteProvider.prototype.buildEndpoint = function (datasourceParams) {
+  if (!datasourceParams) {
+    datasourceParams = this.schema.datasource
+  }
+
+  const source = datasourceParams.source || this.datasource.source
 
   const protocol = source.protocol || 'http'
-  const host = source.host || apiConfig.host
-  const port = source.port || apiConfig.port
+  const host = source.host
+  const port = source.port
 
-  const uri = [protocol, '://', host, (port !== '' ? ':' : ''),
-    port, '/', source.endpoint].join('')
+  const uri = [
+    protocol,
+    '://',
+    host,
+    port !== '' ? ':' : '',
+    port,
+    '/',
+    this.datasource.source.modifiedEndpoint || source.endpoint
+  ].join('')
 
-  this.endpoint = this.processDatasourceParameters(this.schema, uri)
+  // return this.processDatasourceParameters(datasourceParams, uri)
+  this.endpoint = this.processDatasourceParameters(datasourceParams, uri)
+}
+
+/**
+ * Load data from the specified datasource
+ *
+ * @param  {string} requestUrl - datasource endpoint to load
+ * @param  {fn} done - callback on error or completion
+ */
+RemoteProvider.prototype.load = function (requestUrl, done) {
+  this.options = {
+    protocol: this.datasource.source.protocol || 'http',
+    host: this.datasource.source.host,
+    port: this.datasource.source.port || '80',
+    path: url.parse(this.endpoint).path,
+    // path: url.parse(requestUrl).path,
+    method: 'GET'
+  }
+
+  //   this.requestUrl = requestUrl
+  // this.dataCache = DatasourceCache()
+
+  this.options.protocol = this.options.protocol + ':'
+
+  const cacheOptions = {
+    name: this.datasource.name,
+    caching: this.schema.datasource.caching,
+    // endpoint: requestUrl
+    endpoint: this.endpoint
+  }
+
+  this.dataCache.getFromCache(cacheOptions, cachedData => {
+    // data found in the cache, parse into JSON
+    // and return to whatever called load()
+    if (cachedData) {
+      try {
+        cachedData = JSON.parse(cachedData.toString())
+        return done(null, cachedData)
+      } catch (err) {
+        log.error(
+          'Remote: cache data incomplete, making HTTP request: ' +
+            err +
+            '(' +
+            cacheOptions.endpoint +
+            ')'
+        )
+      }
+    }
+
+    debug('load %s', this.endpoint)
+
+    this.getHeaders((err, headers) => {
+      if (err) return done(err)
+
+      this.options = Object.assign({}, this.options, headers)
+
+      this.makeRequest(requestUrl, done)
+    })
+  })
+}
+
+RemoteProvider.prototype.makeRequest = function (requestUrl, done) {
+  debug(
+    'GET datasource "%s" %o',
+    this.datasource.schema.datasource.key,
+    this.options
+  )
+
+  this.options.agent = this.keepAliveAgent(this.options.protocol)
+
+  // Select the agent based on protocol
+  let agent
+
+  if (this.options.protocol.includes('https')) {
+    if (config.get('server.enableHTTP2')) {
+      agent = http2
+    } else {
+      agent = https
+    }
+  } else {
+    agent = http
+  }
+
+  let request = agent.request(this.options, res => {
+    if (
+      res.statusCode === 301 ||
+      res.statusCode === 302 ||
+      res.statusCode === 307
+    ) {
+      this.redirects++
+
+      if (this.redirects >= 10) {
+        const err = new Error('Infinite redirect loop detected')
+        err.remoteIp = this.options.host
+        err.remotePort = this.options.port
+        return done(err)
+      }
+
+      const options = url.parse(res.headers.location)
+      this.options = Object.assign({}, this.options, options)
+
+      debug('following %s redirect to %s', res.statusCode, res.headers.location)
+      this.makeRequest(requestUrl, done)
+    } else {
+      this.handleResponse(requestUrl, res, done)
+    }
+  })
+
+  request.on('error', err => {
+    const message =
+      err.toString() +
+      ". Couldn't request data from " +
+      this.datasource.endpoint
+    err.name = 'GetData'
+    err.message = message
+    err.remoteIp = this.options.host
+    err.remotePort = this.options.port
+    return done(err)
+  })
+
+  request.end()
+}
+
+/**
+ * handleResponse
+ *
+ * @param  {response} res - response
+ * @param  {fn} done - callback
+ * @return {void}
+ */
+RemoteProvider.prototype.handleResponse = function (requestUrl, res, done) {
+  const encoding = res.headers['content-encoding']
+    ? res.headers['content-encoding']
+    : ''
+
+  const buffers = []
+  let output
+
+  if (encoding === 'gzip') {
+    const gunzip = zlib.createGunzip()
+
+    gunzip
+      .on('data', data => {
+        buffers.push(data)
+      })
+      .on('end', () => {
+        output = Buffer.concat(buffers)
+
+        this.processOutput(requestUrl, res, output, (err, data, res) => {
+          if (err) return done(err)
+          return done(null, data, res)
+        })
+      })
+      .on('error', err => {
+        done(err)
+      })
+
+    res.pipe(gunzip)
+  } else {
+    res.on('data', chunk => {
+      buffers.push(chunk)
+    })
+
+    res.on('end', () => {
+      output = Buffer.concat(buffers)
+
+      this.processOutput(requestUrl, res, output, (err, data, res) => {
+        if (err) return done(err)
+        return done(null, data, res)
+      })
+    })
+  }
+}
+
+/**
+ * processOutput
+ *
+ * @param  {response} res
+ * @param  {string} data
+ * @param  {fn} done
+ * @return {void}
+ */
+RemoteProvider.prototype.processOutput = function (requestUrl, res, data, done) {
+  setImmediate(() => {
+    // Return a 202 Accepted response immediately,
+    // along with the datasource response
+    if (res.statusCode === 202) {
+      return done(null, JSON.parse(data.toString()), res)
+    }
+
+    // return 5xx error as the datasource response
+    if (res.statusCode && /^5/.exec(res.statusCode)) {
+      data = {
+        results: [],
+        errors: [
+          {
+            code: 'WEB-0005',
+            title: 'Datasource Timeout',
+            details:
+              "The datasource '" +
+              this.datasource.name +
+              "' timed out: " +
+              res.statusMessage +
+              ' (' +
+              res.statusCode +
+              ')' +
+              ': ' +
+              this.endpoint
+          }
+        ]
+      }
+    } else if (res.statusCode === 404) {
+      data = {
+        results: [],
+        errors: [
+          {
+            code: 'WEB-0004',
+            title: 'Datasource Not Found',
+            details:
+              'Datasource "' +
+              this.datasource.name +
+              '" failed. ' +
+              res.statusMessage +
+              ' (' +
+              res.statusCode +
+              ')' +
+              ': ' +
+              this.endpoint
+          }
+        ]
+      }
+    } else if (res.statusCode && !/200|400/.exec(res.statusCode)) {
+      // if the error is anything other than Success or Bad Request, error
+      const err = new Error()
+      err.message =
+        'Datasource "' +
+        this.datasource.name +
+        '" failed. ' +
+        res.statusMessage +
+        ' (' +
+        res.statusCode +
+        ')' +
+        ': ' +
+        this.endpoint
+      if (data) err.message += '\n' + data
+
+      err.remoteIp = this.options.host
+      err.remotePort = this.options.port
+
+      log.error(
+        { module: 'helper' },
+        res.statusMessage + ' (' + res.statusCode + ')' + ': ' + this.endpoint
+      )
+
+      // return done(err)
+      throw err
+    }
+
+    // Cache 200 responses
+    if (res.statusCode === 200) {
+      log.info(
+        { module: 'remote' },
+        'GOT datasource "' +
+          this.datasource.schema.datasource.key +
+          '": ' +
+          decodeURIComponent(this.endpoint) +
+          ' (HTTP 200, ' +
+          help.formatBytes(Buffer.byteLength(data)) +
+          ')'
+      )
+
+      const cacheOptions = {
+        name: this.datasource.name,
+        caching: this.schema.datasource.caching,
+        endpoint: this.endpoint
+      }
+
+      this.dataCache.cacheResponse(cacheOptions, data, written => {
+        return done(null, JSON.parse(data.toString()))
+      })
+    } else {
+      if (Buffer.isBuffer(data)) {
+        data = data.toString()
+      }
+
+      if (typeof data === 'string') {
+        data = JSON.parse(data)
+      }
+
+      return done(null, data)
+    }
+  })
+}
+
+/**
+ * processRequest - called on every request, rebuild buildEndpoint
+ *
+ * @param  {obj} req - web request object
+ * @return {void}
+ */
+RemoteProvider.prototype.processRequest = function (datasourceParams) {
+  this.buildEndpoint(datasourceParams)
+}
+
+/**
+ * processDatasourceParameters - adds querystring parameters to the datasource endpoint using properties defined in the schema
+ *
+ * @param  {Object} schema - the datasource schema
+ * @param  {type} uri - the original datasource endpoint
+ * @returns {string} the original uri
+ */
+RemoteProvider.prototype.processDatasourceParameters = function (schema, uri) {
+  return uri
 }
 
 /**
@@ -59,90 +385,7 @@ RemoteProvider.prototype.getHeaders = function getHeaders (done) {
     'accept-encoding': 'gzip'
   }
 
-  // If the data-source has its own auth strategy, use it.
-  // Otherwise, authenticate with the main server via bearer token
-  if (this.authStrategy) {
-    // This could eventually become a switch statement that handles different auth types
-    if (this.authStrategy.getType() === 'bearer') {
-      this.authStrategy.getToken(this.authStrategy, (err, bearerToken) => {
-        if (err) {
-          return done(err)
-        }
-
-        headers['Authorization'] = 'Bearer ' + bearerToken
-
-        return done(null, { headers: headers })
-      })
-    }
-  } else {
-    try {
-      help.getToken(this.datasource).then((bearerToken) => {
-        headers['Authorization'] = 'Bearer ' + bearerToken
-
-        help.timer.stop('auth')
-        return done(null, { headers: headers })
-      }).catch((errorData) => {
-        const err = new Error()
-        err.name = errorData.title
-        err.message = errorData.detail
-        err.remoteIp = config.get('api.host')
-        err.remotePort = config.get('api.port')
-        err.path = config.get('auth.tokenUrl')
-
-        if (errorData.stack) {
-          console.log(errorData.stack)
-        }
-
-        help.timer.stop('auth')
-        return done(err)
-      })
-    } catch (err) {
-      console.log(err.stack)
-    }
-  }
-}
-
-/**
- * handleResponse
- *
- * @param  {response} res - response
- * @param  {fn} done - callback
- * @return {void}
- */
-RemoteProvider.prototype.handleResponse = function handleResponse (res, done) {
-  const self = this
-  const encoding = res.headers['content-encoding'] ? res.headers['content-encoding'] : ''
-  let output = ''
-
-  if (encoding === 'gzip') {
-    const gunzip = zlib.createGunzip()
-    const buffer = []
-
-    gunzip.on('data', (data) => {
-      buffer.push(data.toString())
-    }).on('end', () => {
-      output = buffer.join('')
-      self.processOutput(res, output, (err, data, res) => {
-        if (err) return done(err)
-        return done(null, data, res)
-      })
-    }).on('error', (err) => {
-      done(err)
-    })
-
-    res.pipe(gunzip)
-  } else {
-    res.on('data', (chunk) => {
-      output += chunk
-    })
-
-    res.on('end', () => {
-      self.processOutput(res, output, (err, data, res) => {
-        if (err) return done(err)
-        return done(null, data, res)
-      })
-    })
-  }
+  return done(null, { headers })
 }
 
 /**
@@ -152,205 +395,9 @@ RemoteProvider.prototype.handleResponse = function handleResponse (res, done) {
  * @return {module} http|https
  */
 RemoteProvider.prototype.keepAliveAgent = function keepAliveAgent (protocol) {
-  return (protocol === 'https')
+  return protocol.includes('https')
     ? new https.Agent({ keepAlive: true })
     : new http.Agent({ keepAlive: true })
-}
-
-/**
- * load - loads data form the datasource
- *
- * @param  {string} requestUrl - url of the web request (not used)
- * @param  {fn} done - callback on error or completion
- * @return {void}
- */
-RemoteProvider.prototype.load = function (requestUrl, done) {
-  const self = this
-
-  this.requestUrl = requestUrl
-  this.dataCache = new DatasourceCache(this.datasource, requestUrl)
-
-  this.options = {
-    protocol: this.datasource.source.protocol || config.get('api.protocol'),
-    host: this.datasource.source.host || config.get('api.host'),
-    port: this.datasource.source.port || config.get('api.port'),
-    path: url.parse(this.endpoint).path,
-    method: 'GET'
-  }
-
-  this.options.agent = this.keepAliveAgent(this.options.protocol)
-  this.options.protocol = this.options.protocol + ':'
-
-  this.dataCache.getFromCache((cachedData) => {
-    if (cachedData) return done(null, cachedData)
-
-    self.getHeaders((err, headers) => {
-      err && done(err)
-
-      self.options = _.extend(self.options, headers)
-
-      log.info({module: 'helper'}, "GET datasource '" + self.datasource.schema.datasource.key + "': " + self.options.path)
-
-      const agent = (self.options.protocol === 'https') ? https : http
-      let request = agent.request(self.options, (res) => {
-        self.handleResponse(res, done)
-      })
-
-      request.on('error', (err) => {
-        const message = err.toString() + ". Couldn't request data from " + self.datasource.endpoint
-        err.name = 'GetData'
-        err.message = message
-        err.remoteIp = self.options.host
-        err.remotePort = self.options.port
-        return done(err)
-      })
-
-      request.end()
-    })
-  })
-}
-
-/**
- * processDatasourceParameters - adds querystring parameters to the datasource endpoint using properties defined in the schema
- *
- * @param  {json} schema - the datasource schema
- * @param  {type} uri - the original datasource endpoint
- * @return {string} uri with query string appended
- */
-RemoteProvider.prototype.processDatasourceParameters = function processDatasourceParameters (schema, uri) {
-  let query = '?'
-
-  const params = [
-    { 'count': (schema.datasource.count || 0) },
-    { 'skip': (schema.datasource.skip) },
-    { 'page': (schema.datasource.page || 1) },
-    { 'referer': schema.datasource.referer },
-    { 'filter': schema.datasource.filter || {} },
-    { 'fields': schema.datasource.fields || {} },
-    { 'sort': this.processSortParameter(schema.datasource.sort) }
-  ]
-
-  // pass cache flag to API endpoint
-  if (schema.datasource.hasOwnProperty('cache')) {
-    params.push({ 'cache': schema.datasource.cache })
-  }
-
-  params.forEach((param) => {
-    for (let key in param) {
-      if (param.hasOwnProperty(key) && (typeof param[key] !== 'undefined')) {
-        query = query + key + '=' + (_.isObject(param[key]) ? JSON.stringify(param[key]) : param[key]) + '&'
-      }
-    }
-  })
-
-  return uri + query.slice(0, -1)
-}
-
-/**
- * processOutput
- *
- * @param  {response} res
- * @param  {string} data
- * @param  {fn} done
- * @return {void}
- */
-RemoteProvider.prototype.processOutput = function processOutput (res, data, done) {
-  const self = this
-
-  // Return a 202 Accepted response immediately,
-  // along with the datasource response
-  if (res.statusCode === 202) {
-    return done(null, JSON.parse(data), res)
-  }
-
-  // return 5xx error as the datasource response
-  if (res.statusCode && /^5/.exec(res.statusCode)) {
-    data = {
-      'results': [],
-      'errors': [{
-        'code': 'WEB-0005',
-        'title': 'Datasource Timeout',
-        'details': "The datasource '" + this.datasource.name + "' timed out: " + res.statusMessage + ' (' + res.statusCode + ')' + ': ' + this.endpoint
-      }]
-    }
-  } else if (res.statusCode === 404) {
-    data = {
-      'results': [],
-      'errors': [{
-        'code': 'WEB-0004',
-        'title': 'Datasource Not Found',
-        'details': 'Datasource "' + this.datasource.name + '" failed. ' + res.statusMessage + ' (' + res.statusCode + ')' + ': ' + this.endpoint
-      }]
-    }
-  } else if (res.statusCode && !/200|400/.exec(res.statusCode)) {
-    // if the error is anything other than Success or Bad Request, error
-    const err = new Error()
-    err.message = 'Datasource "' + this.datasource.name + '" failed. ' + res.statusMessage + ' (' + res.statusCode + ')' + ': ' + this.endpoint
-    if (data) err.message += '\n' + data
-
-    err.remoteIp = self.options.host
-    err.remotePort = self.options.port
-
-    log.error({module: 'helper'}, res.statusMessage + ' (' + res.statusCode + ')' + ': ' + this.endpoint)
-
-    console.log(err)
-    // return done(err)
-    throw (err)
-  }
-
-  // Cache 200 responses
-  if (res.statusCode === 200) {
-    this.dataCache.cacheResponse(data, () => {
-    })
-  }
-
-  return done(null, data)
-}
-
-/**
- * processRequest - called on every request, rebuild buildEndpoint
- *
- * @param  {obj} req - web request object
- * @return {void}
- */
-RemoteProvider.prototype.processRequest = function processRequest (req) {
-  this.buildEndpoint()
-}
-
-/**
- * processSortParameter
- *
- * @param  {?} obj - sort parameter
- * @return {?}
- */
-RemoteProvider.prototype.processSortParameter = function processSortParameter (obj) {
-  let sort = {}
-
-  if (typeof obj !== 'object' || obj === null) return sort
-
-  if (_.isArray(obj)) {
-    _.each(obj, (value, key) => {
-      if (typeof value === 'object' && value.hasOwnProperty('field') && value.hasOwnProperty('order')) {
-        sort[value.field] = (value.order === 'asc') ? 1 : -1
-      }
-    })
-  } else if (obj.hasOwnProperty('field') && obj.hasOwnProperty('order')) {
-    sort[obj.field] = (obj.order === 'asc') ? 1 : -1
-  } else {
-    sort = obj
-  }
-
-  return sort
-}
-
-/**
- * setAuthStrategy
- *
- * @return {void}
- */
-RemoteProvider.prototype.setAuthStrategy = function setAuthStrategy () {
-  if (!this.schema.datasource.auth) return null
-  this.authStrategy = new BearerAuthStrategy(this.schema.datasource.auth)
 }
 
 module.exports = RemoteProvider

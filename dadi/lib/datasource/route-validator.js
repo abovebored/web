@@ -1,40 +1,48 @@
-var path = require('path')
-var Datasource = require(path.join(__dirname, '/../datasource'))
+const path = require('path')
+const Datasource = require(path.join(__dirname, '/../datasource'))
+const Providers = require(path.join(__dirname, '/../providers'))
 
-var RouteValidator = function (route, param, options) {
-  this.route = route
-  this.param = param
-  this.options = options
-  this.data = {}
+const RouteValidator = function () {
+  this.validationDatasources = {}
 }
 
-RouteValidator.prototype.get = function (req) {
+RouteValidator.prototype.get = function (route, param, options, req) {
   return new Promise((resolve, reject) => {
-    new Datasource(this.route.path, this.param.fetch, this.options).init((err, datasource) => {
-      if (err) {
-        if (err) return reject(err)
-      }
+    let datasource = this.validationDatasources[param.fetch]
 
-      datasource.processRequest(this.route.path, req)
-
-      datasource.provider.load(null, (err, result) => {
+    if (!datasource) {
+      new Datasource(route.path, param.fetch, options).init((err, ds) => {
         if (err) return reject(err)
 
-        if (result) {
-          var results = (typeof result === 'object' ? result : JSON.parse(result))
-          if (results.results && results.results.length > 0) {
-            return resolve('')
-          } else {
-            return reject('')
-          }
-        }
+        this.validationDatasources[param.fetch] = datasource = ds
       })
+    }
+
+    datasource.provider = new Providers[datasource.source.type]()
+    datasource.provider.initialise(datasource, datasource.schema)
+
+    datasource.processRequest(route.path, req)
+
+    return datasource.provider.load(req.url, (err, data) => {
+      if (err) return reject(err)
+
+      datasource.provider = null
+
+      if (data && data.results && data.results.length > 0) {
+        return resolve('')
+      } else {
+        return reject('')
+      }
     })
   })
 }
 
-module.exports = function (route, param, options) {
-  return new RouteValidator(route, param, options)
-}
+let instance
 
-module.exports.RouteValidator = RouteValidator
+module.exports = function () {
+  if (!instance) {
+    instance = new RouteValidator()
+  }
+
+  return instance
+}

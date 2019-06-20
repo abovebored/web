@@ -7,10 +7,12 @@ var testConfigSamplePath = './config/config.test.json.sample'
 
 function loadConfig () {
   try {
-    var testConfig = fs.readFileSync(testConfigPath, { encoding: 'utf-8'})
+    var testConfig = fs.readFileSync(testConfigPath, { encoding: 'utf-8' })
   } catch (err) {
     if (err.code === 'ENOENT') {
-      var testConfigSample = fs.readFileSync(testConfigSamplePath, { encoding: 'utf-8'})
+      var testConfigSample = fs.readFileSync(testConfigSamplePath, {
+        encoding: 'utf-8'
+      })
 
       fs.writeFileSync(testConfigPath, testConfigSample)
       loadConfig()

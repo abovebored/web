@@ -1,24 +1,31 @@
-var middleware = module.exports
-var path = require('path')
-var proxyaddr = require('proxy-addr')
+const middleware = module.exports
+const path = require('path')
+const proxyaddr = require('proxy-addr')
 
-var config = require(path.resolve(path.join(__dirname, '/../../../config.js')))
-var log = require('@dadi/logger')
+const config = require(path.resolve(
+  path.join(__dirname, '/../../../config.js')
+))
+const log = require('@dadi/logger')
+const debug = require('debug')('web:middleware')
 
-var HTTP = 'http:'
-var HTTPS = 'https:'
+const HTTP = 'http:'
+const HTTPS = 'https:'
 
-var compileTrust = function (val) {
+const compileTrust = function (val) {
   if (typeof val === 'function') return val
 
   if (val === true) {
     // Support plain true/false
-    return function () { return true }
+    return function () {
+      return true
+    }
   }
 
   if (typeof val === 'number') {
     // Support trusting hop count
-    return function (a, i) { return i < val }
+    return function (a, i) {
+      return i < val
+    }
   }
 
   if (typeof val === 'string') {
@@ -30,8 +37,8 @@ var compileTrust = function (val) {
 }
 
 middleware.handleHostHeader = function () {
-  return function (req, res, next) {
-    if (!req.headers.host || req.headers.host === '') {
+  return function hostHeaderCheck (req, res, next) {
+    if (!(req.headers.host || req.headers[':authority']) || (req.headers.host || req.headers[':authority']) === '') {
       res.statusCode = 400
       return res.end()
     } else {
@@ -41,13 +48,13 @@ middleware.handleHostHeader = function () {
 }
 
 middleware.setUpRequest = function () {
-  return function (req, res, next) {
+  return function populateRequest (req, res, next) {
     Object.defineProperty(req, 'protocol', {
       get: function () {
-        var protocol = config.get('server.protocol')
+        let protocol = config.get('server.protocol')
 
         // var protocol = req.connection.encrypted ? 'https' : 'http'
-        var trust = compileTrust(config.get('security.trustProxy'))
+        const trust = compileTrust(config.get('security.trustProxy'))
 
         if (!trust(req.connection.remoteAddress, 0)) {
           return protocol
@@ -81,7 +88,7 @@ middleware.setUpRequest = function () {
      */
     Object.defineProperty(req, 'ip', {
       get: function () {
-        var trust = compileTrust(config.get('security.trustProxy'))
+        const trust = compileTrust(config.get('security.trustProxy'))
         return proxyaddr(this, trust)
       },
       enumerable: true,
@@ -101,8 +108,8 @@ middleware.setUpRequest = function () {
      */
     Object.defineProperty(req, 'ips', {
       get: function () {
-        var trust = compileTrust(config.get('security.trustProxy'))
-        var addrs = proxyaddr.all(this, trust)
+        const trust = compileTrust(config.get('security.trustProxy'))
+        const addrs = proxyaddr.all(this, trust)
         return addrs.slice(1).reverse()
       },
       enumerable: true,
@@ -114,15 +121,14 @@ middleware.setUpRequest = function () {
 }
 
 middleware.transportSecurity = function () {
-  var protocol = config.get('server.protocol') || 'http'
-  var scheme = protocol === 'https' ? HTTPS : HTTP
-
   function securityEnabled () {
-    return scheme === HTTPS
+    const transportSecurity = config.get('security.transportSecurity')
+    const protocol = config.get('server.protocol')
+    return protocol === 'https' || transportSecurity
   }
 
   function redirect (req, res, scheme) {
-    var location = scheme + '//' + req.headers.host + req.url
+    const location = scheme + '//' + (req.headers.host || req.headers[':authority']) + req.url
     res.writeHead(301, {
       Location: location
     })
@@ -130,12 +136,12 @@ middleware.transportSecurity = function () {
   }
 
   if (securityEnabled()) {
-    log.info('Transport security is enabled.')
+    debug('Transport security is enabled.')
   } else {
-    log.info('Transport security is not enabled.')
+    debug('Transport security is not enabled.')
   }
 
-  return function (req, res, next) {
+  return function protocolRedirect (req, res, next) {
     if (securityEnabled() && !req.secure) {
       log.info('Redirecting insecure request for', req.url)
       redirect(req, res, HTTPS)

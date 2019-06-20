@@ -1,28 +1,28 @@
-/*
-REWRITE INFO:
-https://github.com/tinganho/connect-modrewrite
-*/
-var _ = require('underscore')
-var debug = require('debug')('web:router')
-var es = require('event-stream')
-var fs = require('fs')
-var path = require('path')
-var pathToRegexp = require('path-to-regexp')
-var toobusy = require('toobusy-js')
-var url = require('url')
+'use strict'
 
-var config = require(path.resolve(path.join(__dirname, '/../../../config')))
-var help = require(path.join(__dirname, '/../help'))
-var log = require('@dadi/logger')
-var rewrite = require(path.join(__dirname, '/rewrite'))
+const debug = require('debug')('web:router')
+const es = require('event-stream')
+const fs = require('fs')
+const path = require('path')
+const pathToRegexp = require('path-to-regexp')
+const toobusy = require('toobusy-js')
+const url = require('url')
 
-var Datasource = require(path.join(__dirname, '/../datasource'))
-var Preload = require(path.join(__dirname, '../datasource/preload'))
-var RouteValidator = require(path.join(__dirname, '../datasource/route-validator'))
+const config = require(path.resolve(path.join(__dirname, '/../../../config')))
+const help = require(path.join(__dirname, '/../help'))
+const log = require('@dadi/logger')
+const rewrite = require('connect-modrewrite')
 
-var rewriteFunction = null
+const Datasource = require(path.join(__dirname, '/../datasource'))
+const Preload = require(path.join(__dirname, '../datasource/preload'))
+const RouteValidator = require(path.join(
+  __dirname,
+  '../datasource/route-validator'
+))
 
-var Router = function (server, options) {
+let rewriteFunction = null
+
+const Router = function (server, options) {
   this.data = {}
   this.params = {}
   this.constraints = {}
@@ -30,7 +30,10 @@ var Router = function (server, options) {
   this.handlers = []
   this.rules = []
 
-  this.rewritesFile = config.get('rewrites.path') === '' ? null : path.resolve(config.get('rewrites.path'))
+  this.rewritesFile =
+    config.get('rewrites.path') === ''
+      ? null
+      : path.resolve(config.get('rewrites.path'))
   this.rewritesDatasource = config.get('rewrites.datasource')
   this.loadDatasourceAsFile = config.get('rewrites.loadDatasourceAsFile')
 
@@ -43,60 +46,69 @@ var Router = function (server, options) {
   }
 
   // load the route constraint specifications if they exist
+  let constraintsPath
   try {
-    var constraintsPath = path.join(options.routesPath, '/constraints.js')
+    constraintsPath = path.join(options.routesPath, '/constraints.js')
     delete require.cache[constraintsPath]
     this.handlers = require(constraintsPath)
+
+    log.info(
+      { module: 'router' },
+      'Route constraints loaded (' + constraintsPath + ')'
+    )
   } catch (err) {
-    log.info({module: 'router'}, 'No route constraints loaded, file not found (' + constraintsPath + ')')
+    log.debug(
+      { module: 'router' },
+      'No route constraints loaded, file not found (' + constraintsPath + ')'
+    )
   }
 }
 
 Router.prototype.loadRewrites = function (options, done) {
-  var self = this
+  let self = this
   self.rules = []
 
   if (self.rewritesDatasource && self.loadDatasourceAsFile) {
     // Get the rewritesDatasource
-    new Datasource(self.rewritesDatasource, self.rewritesDatasource, this.options).init(function (err, ds) {
+    new Datasource(
+      self.rewritesDatasource,
+      self.rewritesDatasource,
+      this.options
+    ).init(function (err, ds) {
       if (err) {
-        log.error({module: 'router'}, err)
+        log.error({ module: 'router' }, err)
       }
-
-      // var endpointParts = ds.source.endpoint.split('/')
-      //
-      // var api = new DadiAPI({
-      //   uri: config.get('api.protocol') + '://' + config.get('api.host'),
-      //   port: config.get('api.port'),
-      //   credentials: {
-      //     clientId: config.get('auth.clientId'),
-      //     secret: config.get('auth.secret')
-      //   },
-      //   version: endpointParts[0],
-      //   database: endpointParts[1]
-      // })
 
       function refreshRewrites (cb) {
         // Get redirects from API collection
-        var freshRules = []
-        ds.provider.load(null, function (err, response) {
+        let freshRules = []
+        ds.provider.load(null, (err, response) => {
           if (err) {
-            console.log('Error loading data in Router Rewrite module')
-            console.log(err)
+            log.error(
+              { module: 'router' },
+              'Error loading rewrite datasource "' +
+                ds.name +
+                '" in Router Rewrite module'
+            )
             return cb(null)
           }
 
-          if (response) {
-            response = JSON.parse(response)
-          }
-
           if (response.results) {
-            // api.in(self.rewritesDatasource).find().then(function (response)
-            var idx = 0
+            let idx = 0
 
-            _.each(response.results, function (rule) {
-              freshRules.push(rule.rule + ' ' + rule.replacement + ' ' + '[R=' + rule.redirectType + ',L]')
+            response.results.forEach(rule => {
+              freshRules.push(
+                rule.rule +
+                  ' ' +
+                  rule.replacement +
+                  ' ' +
+                  '[R=' +
+                  rule.redirectType +
+                  ',L]'
+              )
+
               idx++
+
               if (idx === response.results.length) {
                 self.rules = freshRules
                 log.info('Loaded ' + idx + ' rewrites')
@@ -110,25 +122,31 @@ Router.prototype.loadRewrites = function (options, done) {
         })
       }
 
-      setInterval(refreshRewrites, config.get('rewrites.datasourceRefreshTime') * 60 * 1000)
+      setInterval(
+        refreshRewrites,
+        config.get('rewrites.datasourceRefreshTime') * 60 * 1000
+      )
       refreshRewrites(done)
     })
   } else if (self.rewritesFile) {
-    var rules = []
-    var stream = fs.createReadStream(self.rewritesFile, {encoding: 'utf8'})
+    let rules = []
+    const stream = fs.createReadStream(self.rewritesFile, { encoding: 'utf8' })
 
-    stream.pipe(es.split('\n'))
-      .pipe(es.mapSync(function (data) {
+    stream.pipe(es.split('\n')).pipe(
+      es.mapSync(function (data) {
         if (data !== '') rules.push(data)
       })
     )
 
-    stream.on('error', function (err) {
-      log.error({module: 'router'}, 'No rewrites loaded, file not found (' + self.rewritesFile + ')')
+    stream.on('error', err => {
+      log.error(
+        { module: 'router' },
+        'No rewrites loaded, file not found (' + self.rewritesFile + ')'
+      )
       done(err)
     })
 
-    stream.on('end', function () {
+    stream.on('end', () => {
       self.rules = rules.slice(0)
       done(null)
     })
@@ -150,89 +168,133 @@ Router.prototype.constrain = function (route, constraint) {
     this.constraints[route] = this.handlers[constraint]
     debug('added route constraint function "%s" for %s', constraint, route)
   } else {
-    var error = "Route constraint '" + constraint + "' not found. Is it defined in '" + this.options.routesPath + "/constraints.js'?"
-    var err = new Error(error)
+    const error =
+      "Route constraint '" +
+      constraint +
+      "' not found. Is it defined in '" +
+      this.options.routesPath +
+      "/constraints.js'?"
+    let err = new Error(error)
     err.name = 'Router'
-    log.error({module: 'router'}, error)
-    throw (err)
+    log.error({ module: 'router' }, error)
+    throw err
   }
-
-  return
 }
 
 /**
  * Validates the current route against existing data or business rules
  */
-Router.prototype.validate = function (route, req, res) {
+Router.prototype.validate = function (route, options, req, res) {
   return new Promise((resolve, reject) => {
     // test the supplied url against each matched route.
     // for example: does "/test/2" match "/test/:page"?
-    var pathname = url.parse(req.url, true).pathname
-    var regex = pathToRegexp(route.path)
-    var match = regex.exec(pathname)
+    const pathname = url.parse(req.url, true).pathname
+    const keys = []
+    const regex = pathToRegexp(route.path, keys)
+    const match = regex.exec(pathname)
 
-    // allow a 404 to sail through this
-    if (route.path === '/404') {
+    // don't subject 404 and 5xx to validation
+    if (/(404|5[0-9]{2})/.test(res.statusCode)) {
       return resolve()
     }
 
     // move to the next route if no match
     if (!match) {
-      return reject('')
+      return reject(new Error('no match'))
     }
 
     // get all the dynamic keys from the route
     // i.e. anything that starts with ":" -> "/news/:title"
-    this.injectRequestParams(match, regex.keys, req)
+    this.injectRequestParams(match, keys, req)
 
-    var paramsPromises = []
+    let paramsPromises = []
 
-    _.each(route.params, (param) => {
-      paramsPromises.push(new Promise((resolve, reject) => {
-        if (_.isEmpty(route.params)) {
-          return resolve('')
-        }
+    if (!route.params || route.params.length === 0) {
+      return resolve('')
+    }
 
-        if (param.preload && param.preload.source) {
-          var data = Preload().get(param.preload.source)
-          var matches = _.filter(data, (record) => {
-            return record[param.preload.field] === req.params[param.param]
-          })
+    route.params.forEach(param => {
+      paramsPromises.push(
+        new Promise((resolve, reject) => {
+          if (param.preload && param.preload.source) {
+            const data = Preload().get(param.preload.source)
+            const matches = data.filter(record => {
+              return record[param.preload.field] === req.params[param.param]
+            })
 
-          if (!_.isEmpty(matches)) {
-            return resolve('')
-          } else {
-            return reject('Parameter "' + param.param + '=' + req.params[param.param] + '" not found in preloaded data "' + param.preload.source + '"')
+            if (matches.length > 0) {
+              return resolve('')
+            } else {
+              return reject(
+                new Error(
+                  'Parameter "' +
+                    param.param +
+                    '=' +
+                    req.params[param.param] +
+                    '" not found in preloaded data "' +
+                    param.preload.source +
+                    '"'
+                )
+              )
+            }
+          } else if (param.in && Array.isArray(param.in)) {
+            if (
+              req.params[param.param] &&
+              param.in.includes(req.params[param.param])
+            ) {
+              return resolve('')
+            } else {
+              return reject(
+                new Error(
+                  'Parameter "' +
+                    param.param +
+                    '=' +
+                    req.params[param.param] +
+                    '" not found in array "' +
+                    param.in +
+                    '"'
+                )
+              )
+            }
+          } else if (param.fetch) {
+            RouteValidator()
+              .get(route, param, this.options, req)
+              .then(() => {
+                return resolve('')
+              })
+              .catch(err => {
+                return reject(
+                  new Error(
+                    'Parameter "' +
+                      param.param +
+                      '=' +
+                      req.params[param.param] +
+                      '" not found in datasource "' +
+                      param.fetch +
+                      '". ' +
+                      err
+                  )
+                )
+              })
           }
-        } else if (param.in && _.isArray(param.in)) {
-          if (req.params[param.param] && _.contains(param.in, req.params[param.param])) {
-            return resolve('')
-          } else {
-            return reject('Parameter "' + param.param + '=' + req.params[param.param] + '" not found in array "' + param.in + '"')
-          }
-        } else if (param.fetch) {
-          var routeValidator = new RouteValidator(route, param, this.options)
-          routeValidator.get(req).then(() => {
-            return resolve('')
-          }).catch((err) => {
-            return reject('Parameter "' + param.param + '=' + req.params[param.param] + '" not found in datasource "' + param.fetch + '". ' + err)
-          })
-        }
-      }))
+        })
+      )
     })
 
-    Promise.all(paramsPromises).then((result) => {
-      this.testConstraint(route.path, req, res, (passed) => {
-        if (passed) {
-          return resolve('')
-        } else {
-          return reject('')
-        }
+    Promise.all(paramsPromises)
+      .then(result => {
+        this.testConstraint(route.path, req, res, (_, passed) => {
+          if (passed) {
+            return resolve('')
+          } else {
+            return reject(new Error('testConstraint returned false'))
+          }
+        })
       })
-    }).catch((err) => {
-      log.warn(err)
-      return reject('')
-    })
+      .catch(err => {
+        log.warn(err)
+        return reject(err)
+      })
   })
 }
 
@@ -246,7 +308,7 @@ Router.prototype.injectRequestParams = function (matchedRoute, keys, req) {
   matchedRoute.forEach((property, index) => {
     // get the dynamic route key that is
     // at the same index as we are in the loop
-    var keyOpts = keys[index] || {}
+    const keyOpts = keys[index] || {}
 
     // NOTE: the value for the key is found one slot ahead of the current index, because the first property
     // was the full matched string e.g. /test/2 and the values for the keys appear next
@@ -268,34 +330,40 @@ Router.prototype.injectRequestParams = function (matchedRoute, keys, req) {
 Router.prototype.testConstraint = function (route, req, res, callback) {
   // no constraint against this route, let's use it
   if (!this.constraints[route]) {
-    return callback(true)
+    return callback(null, true)
   }
 
   // if there's a constraint handler for this route, run it
-  log.debug({module: 'router'}, 'Testing constraint for route "' + route + '" and URL "' + req.url + '"')
+  log.debug(
+    { module: 'router' },
+    'Testing constraint for route "' + route + '" and URL "' + req.url + '"'
+  )
 
   if (typeof this.constraints[route] === 'function') {
     help.timer.start('router constraint: ' + route)
 
-    this.constraints[route](req, res, function (result) {
+    this.constraints[route](req, res, result => {
       help.timer.stop('router constraint: ' + route)
-      return callback(result)
+      return callback(null, result)
     })
   } else {
-    return callback(true)
+    return callback(null, true)
   }
 }
 
 Router.prototype.loadRewriteModule = function () {
-  log.info({module: 'router'}, 'Rewrite module reload.')
-  log.info({module: 'router'}, this.rules.length + ' rewrites/redirects loaded.')
+  log.info({ module: 'router' }, 'Rewrite module reload.')
+  log.info(
+    { module: 'router' },
+    this.rules.length + ' rewrites/redirects loaded.'
+  )
 }
 
 module.exports = function (server, options) {
   server.app.Router = new Router(server, options)
 
   // middleware which blocks requests when we're too busy
-  server.app.use(function (req, res, next) {
+  server.app.use(function tooBusy (req, res, next) {
     if (config.get('toobusy.enabled') && toobusy()) {
       res.statusCode = 503
       return res.end('HTTP Error 503 - Server Busy')
@@ -308,60 +376,91 @@ module.exports = function (server, options) {
   server.app.Router.loadRewrites(options, function (err) {
     if (err) console.log(err)
 
-    this.shouldCall = true
     rewriteFunction = rewrite(server.app.Router.rules)
 
-    // determine if we need to even call
-    server.app.use(function (req, res, next) {
-      this.shouldCall = rewriteFunction.call(server.app.Router, req, res, next)
-      if (!res.finished) next()
+    // process rewrite rules first
+    server.app.use(function rewrites (req, res, next) {
+      rewriteFunction(req, res, next)
     })
 
     // load rewrites from our DS and handle them
-    server.app.use(function (req, res, next) {
-      if (!this.shouldCall) return next()
+    server.app.use(function datasourceRewrites (req, res, next) {
+      debug('processing %s', req.url)
 
-      log.debug({module: 'router'}, '[Router] processing: ' + req.url)
+      if (
+        !server.app.Router.rewritesDatasource ||
+        server.app.Router.loadDatasourceAsFile ||
+        server.app.Router.rewritesDatasource === ''
+      ) {
+        debug('no rewrites loaded')
+        return next()
+      }
 
-      if (!server.app.Router.rewritesDatasource || server.app.Router.loadDatasourceAsFile || server.app.Router.rewritesDatasource === '') return next()
+      debug('processing rewrites', req.url)
 
-      new Datasource('rewrites', server.app.Router.rewritesDatasource, options).init(function (err, ds) {
+      new Datasource(
+        'rewrites',
+        server.app.Router.rewritesDatasource,
+        options
+      ).init((err, ds) => {
         if (err) {
           console.log(err)
-          throw (err)
+          throw err
         }
 
-        _.extend(ds.schema.datasource.filter, { 'rule': req.url })
+        ds.schema.datasource.filter = Object.assign({}, { rule: req.url })
 
         ds.provider.processRequest(ds.page.name, req)
 
-        ds.provider.load(req.url, function (err, result) {
+        debug('load rewrites', req.url)
+
+        ds.provider.load(req.url, function (err, data) {
           if (err) {
-            console.log('Error loading data in Router Rewrite module')
+            log.error(
+              { module: 'router' },
+              'Error loading datasource "' +
+                ds.name +
+                '" in Router Rewrite module'
+            )
             return next(err)
           }
 
-          if (result) {
-            var results = (typeof result === 'object') ? result : JSON.parse(result)
+          if (data) {
+            // results = JSON.parse(data.toString())
+            const results = data
 
-            if (results && results.results && results.results.length > 0 && results.results[0].rule === req.url) {
-              var rule = results.results[0]
-              var location
+            if (
+              results &&
+              results.results &&
+              results.results.length > 0 &&
+              results.results[0].rule === req.url
+            ) {
+              const rule = results.results[0]
+              let location
               if (/:\/\//.test(rule.replacement)) {
                 location = req.url.replace(rule.rule, rule.replacement)
               } else {
-                location = 'http' + '://' + req.headers.host + req.url.replace(rule.rule, rule.replacement)
+                location =
+                  'http' +
+                  '://' +
+                  (req.headers.host || req.headers[':authority']) +
+                  req.url.replace(rule.rule, rule.replacement)
               }
 
-              var headers = {
+              let headers = {
                 Location: location
               }
 
-              _.each(config.get('headers.cacheControl'), (value, key) => {
-                if (rule.redirectType.toString() === key && value !== '') {
-                  headers['Cache-Control'] = value
-                }
-              })
+              let cacheHeaders = config.get('headers.cacheControl')
+              if (Object.keys(cacheHeaders).length > 0) {
+                Object.keys(cacheHeaders).forEach(key => {
+                  const value = cacheHeaders[key]
+
+                  if (rule.redirectType.toString() === key && value !== '') {
+                    headers['Cache-Control'] = value
+                  }
+                })
+              }
 
               res.writeHead(rule.redirectType, headers)
               res.end()
@@ -376,24 +475,29 @@ module.exports = function (server, options) {
     })
 
     // handle generic url rewrite rules
-    server.app.use(function (req, res, next) {
-      var redirect = false
-      var location = req.url
-      var rewritesConfig = config.get('rewrites')
-      var protocol = config.get('server.protocol') || 'http'
+    server.app.use(function configurableRewrites (req, res, next) {
+      debug('processing configurable rewrites %s', req.url)
+
+      let redirect = false
+      let location = req.url
+      const parsed = url.parse(location, true)
+      let pathname = parsed.pathname
+      const rewritesConfig = config.get('rewrites')
+      const protocol = config.get('server.protocol') || 'http'
 
       // force a URL to lowercase
       if (rewritesConfig.forceLowerCase) {
-        if (location !== location.toLowerCase()) {
-          location = location.toLowerCase()
+        if (pathname !== pathname.toLowerCase()) {
+          pathname = pathname.toLowerCase()
+          location = location.replace(parsed.pathname, pathname)
           redirect = true
         }
       }
 
       // stripIndexPages
-      if (!_.isEmpty(rewritesConfig.stripIndexPages)) {
-        var files = rewritesConfig.stripIndexPages
-        var re = new RegExp(files.join('|'), 'gi')
+      if (rewritesConfig.stripIndexPages.length > 0) {
+        const files = rewritesConfig.stripIndexPages
+        const re = new RegExp(files.join('|'), 'gi')
 
         if (location.match(re)) {
           location = location.replace(re, '')
@@ -403,19 +507,24 @@ module.exports = function (server, options) {
 
       // force a trailing slash
       if (rewritesConfig.forceTrailingSlash) {
-        var parsed = url.parse(location, true)
-        if (/^([^.]*[^/])$/.test(parsed.pathname) === true) {
-          location = parsed.pathname + '/' + parsed.search
+        if (/^([^.]*[^/])$/.test(pathname) === true) {
+          location = `${pathname}/${parsed.search || ''}`
           redirect = true
         }
       }
 
       if (redirect) {
+        debug(
+          'redirecting %s to %s',
+          req.url,
+          protocol + '://' + (req.headers.host || req.headers[':authority']) + location
+        )
         res.writeHead(301, {
-          Location: protocol + '://' + req.headers.host + location
+          Location: protocol + '://' + (req.headers.host || req.headers[':authority']) + location
         })
         res.end()
       } else {
+        debug('no rewrites matched %s', req.url)
         return next()
       }
     })

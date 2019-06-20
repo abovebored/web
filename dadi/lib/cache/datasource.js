@@ -1,88 +1,122 @@
 /**
  * @module Cache
  */
-var _ = require('underscore')
-var path = require('path')
-var url = require('url')
-var crypto = require('crypto')
-var s = require('underscore.string')
+const crypto = require('crypto')
+const debug = require('debug')('web:datasource-cache')
+const merge = require('deepmerge')
+const path = require('path')
+const url = require('url')
 
-var mainCache = require(path.join(__dirname, '/index.js'))
-var config = require(path.join(__dirname, '/../../../config.js'))
-var log = require('@dadi/logger')
-
-var DadiCache = require('@dadi/cache')
+const Cache = require(path.join(__dirname, '/index.js'))
+const config = require(path.join(__dirname, '/../../../config.js'))
+const log = require('@dadi/logger')
 
 /**
- * Creates a new DatasourceCache instance for the specified datasource.
+ * Creates a new DatasourceCache singleton for caching datasource results
  * @constructor
- * @param {object} datasource - a datasource schema object containing the datasource settings
  */
-var DatasourceCache = function (datasource) {
-  this.datasource = datasource
+const DatasourceCache = function () {
+  this.cacheOptions = config.get('caching')
+  this.cache = Cache().cache
 
-  this.mainCache = mainCache()
+  const directoryEnabled = this.cacheOptions.directory.enabled
+  const redisEnabled = this.cacheOptions.redis.enabled
 
-  // enabled if main cache module is enabled and this is not a static datasource
-  this.enabled = this.mainCache.enabled && this.datasource.source.type !== 'static'
-
-  // we build the filename with a hashed hex string so we can be unique
-  // and avoid using file system reserved characters in the name, but not
-  // all datasource providers work with url endpoints so we allow the use of
-  // a unique cacheKey instead
-  this.filename = crypto.createHash('sha1').update(this.datasource.name).digest('hex')
-
-  if (this.datasource.provider.cacheKey) {
-    this.filename += '_' + crypto.createHash('sha1').update(this.datasource.provider.cacheKey).digest('hex')
-  } else {
-    this.filename += '_' + crypto.createHash('sha1').update(this.datasource.provider.endpoint).digest('hex')
-  }
-
-  this.options = this.datasource.schema.datasource.caching || {}
-
-  if (_.isEmpty(this.options)) {
-    this.options = config.get('caching')
-  } else {
-    this.options = _.extend(config.get('caching'), this.options)
-  }
-
-  if (!this.options.directory || s.isBlank(this.options.directory.path)) {
-    this.options.directory = {
-      path: config.get('caching.directory.path')
-    }
-  }
-
-  if (!this.options.directory.extension || s.isBlank(this.options.directory.extension)) {
-    this.options.directory.extension = '.json'
-  }
-
-  this.cache = new DadiCache(this.options)
+  this.enabled = !(directoryEnabled === false && redisEnabled === false)
 }
 
-// DatasourceCache.prototype.setCachePath = function () {
-//   var cachePath = '.'
-//   var defaultExtension = '.json'
-//
-//   // if the datasource file defines a directory and extension, use those, otherwise
-//   // fallback to using the main cache module settings
-//   if (!s.isBlank(this.options.directory) && !s.isBlank(this.options.extension)) {
-//     cachePath = path.join(this.options.directory, this.filename + '.' + this.options.extension)
-//   } else {
-//     cachePath = path.join(this.mainCache.dir, this.filename + defaultExtension)
-//   }
-//
-//   this.cachepath = cachePath
-// }
+/**
+ * Get datasource data from the cache if it exists
+ * @param {object} datasource - a datasource schema object containing the datasource settings
+ * @param {fn} done - the method to call when finished, accepts 1 arg:
+ *   if the cache key was found, returns {Buffer} data
+ *   if the cache key was not found, returns false
+ */
+DatasourceCache.prototype.getFromCache = function (opts, done) {
+  debug('get (%s)', opts.name)
+
+  if (!this.cachingEnabled(opts)) {
+    return done(false)
+  }
+
+  if (this.stillCaching) {
+    return done(false)
+  }
+
+  const filename = this.getFilename(opts)
+  const options = this.getOptions(opts)
+
+  const buffers = []
+
+  // attempt to get from the cache
+  this.cache
+    .get(filename, options)
+    .then(stream => {
+      debug('serving %s from cache (%s)', opts.name, filename)
+      log.info('serving %s from cache (%s)', opts.name, filename)
+
+      stream.on('data', chunk => {
+        if (chunk) {
+          buffers.push(chunk)
+        }
+      })
+
+      stream.on('end', () => {
+        return done(Buffer.concat(buffers))
+      })
+    })
+    .catch(() => {
+      // key doesn't exist in cache
+      return done(false)
+    })
+}
+
+/**
+ * Cache the supplied data it caching is enabled for the datasource
+ *
+ * @param  {Object} datasource - the datasource instance
+ * @param  {Buffer} data - the body of the response as a Buffer
+ * @param  {fn} done - the method to call when finished, accepts args (Boolean written)
+ */
+DatasourceCache.prototype.cacheResponse = function (opts, data, done) {
+  const enabled = this.cachingEnabled(opts)
+
+  if (!enabled) {
+    return done(false)
+  }
+
+  if (this.stillCaching) {
+    return done(false)
+  }
+
+  debug('write to cache (%s)', opts.name)
+
+  const filename = this.getFilename(opts)
+  const options = this.getOptions(opts)
+
+  this.stillCaching = true
+
+  this.cache
+    .set(filename, data, options)
+    .then(() => {
+      this.stillCaching = false
+      return done(true)
+    })
+    .catch(err => {
+      log.info('datasource cache fail: ', err)
+    })
+}
 
 /**
  *
+ * @param {object} datasource - a datasource schema object containing the datasource settings
  */
-DatasourceCache.prototype.cachingEnabled = function () {
-  var enabled = this.enabled || false
+DatasourceCache.prototype.cachingEnabled = function (opts) {
+  let enabled = this.enabled
 
   // check the querystring for a no cache param
-  if (typeof this.datasource.provider.endpoint !== 'undefined') {
-    var query = url.parse(this.datasource.provider.endpoint, true).query
+  if (typeof opts.endpoint !== 'undefined') {
+    const query = url.parse(opts.endpoint, true).query
     if (query.cache && query.cache === 'false') {
       enabled = false
     }
@@ -92,50 +126,62 @@ DatasourceCache.prototype.cachingEnabled = function () {
     enabled = false
   }
 
+  const options = this.getOptions(opts)
+
+  debug('options (%s): %o', opts.name, options)
+
   // enabled if the datasource caching block says it's enabled
-  return enabled && (this.options.directory.enabled || this.options.redis.enabled)
+  return enabled && (options.directory.enabled || options.redis.enabled)
 }
 
 /**
- *
+ * Construct the file cache key
+ * We build the filename with a hashed hex string so we can be unique
+ * and avoid using file system reserved characters in the name, but not
+ * all datasource providers work with url endpoints so we allow the use of
+ * a unique cacheKey instead
+ * @param {object} datasource - a datasource schema object containing the datasource settings
  */
-DatasourceCache.prototype.getFromCache = function (done) {
-  if (!this.cachingEnabled()) {
-    return done(false)
+DatasourceCache.prototype.getFilename = function (opts) {
+  let filename = crypto
+    .createHash('sha1')
+    .update(opts.name)
+    .digest('hex')
+
+  if (opts.cacheKey) {
+    filename +=
+      '_' +
+      crypto
+        .createHash('sha1')
+        .update(opts.cacheKey)
+        .digest('hex')
+  } else {
+    filename +=
+      '_' +
+      crypto
+        .createHash('sha1')
+        .update(opts.endpoint)
+        .digest('hex')
   }
 
-  var data = ''
-
-  // attempt to get from the cache
-  this.cache.get(this.filename).then((stream) => {
-    log.info({module: 'cache'}, 'Serving datasource from Redis (' + this.datasource.name + ', ' + this.filename + ')')
-
-    stream.on('data', (chunk) => {
-      if (chunk) data += chunk
-    })
-
-    stream.on('end', () => {
-      return done(data)
-    })
-  }).catch(() => {
-    // key doesn't exist in cache
-    return done(false)
-  })
+  return filename
 }
 
 /**
  *
+ * @param {object} datasource - a datasource schema object containing the datasource settings
+ * @returns {object} options for the cache
  */
-DatasourceCache.prototype.cacheResponse = function (data, done) {
-  if (!this.cachingEnabled()) return
+DatasourceCache.prototype.getOptions = function (opts) {
+  const options = merge(this.cacheOptions, opts.caching || {})
 
-  this.cache.set(this.filename, data).then(() => {
-    done()
-  })
+  options.directory.extension = 'json'
+
+  return options
 }
 
-module.exports = function (datasource) {
-  return new DatasourceCache(datasource)
-}
+module.exports._reset = function () {}
 
-module.exports.DatasourceCache = DatasourceCache
+module.exports = function () {
+  return new DatasourceCache()
+}

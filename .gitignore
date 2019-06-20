@@ -3,10 +3,10 @@
 
 public/*
 app/*
-workspace/*
 !test/app
 !test/app/public
 !test/workspace
+test/app/uploads/**/*
 
 # Config
 config.json
@@ -46,3 +46,4 @@ build/Release
 # Deployed apps should consider commenting this line out:
 # see https://npmjs.org/doc/faq.html#Should-I-check-my-node_modules-folder-into-git
 node_modules
+/package-lock.json
